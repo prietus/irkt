@@ -173,6 +173,9 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
             let mut cap_state = CapState::default();
             let mut batches: HashMap<String, BatchInfo> = HashMap::new();
             let mut isupport = ISupport::default();
+            // Accumulate multi-line NAMES (353) replies per channel until the
+            // closing 366; big channels split the list across many 353 lines.
+            let mut names_acc: HashMap<String, Vec<MemberEntry>> = HashMap::new();
 
             loop {
                 tokio::select! {
@@ -252,7 +255,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                             if accumulate_multiline_chunk(&msg, &mut batches) {
                                 continue;
                             }
-                            for ev in translate(msg, &batches, &mut isupport) {
+                            for ev in translate(msg, &batches, &mut isupport, &mut names_acc) {
                                 if out.send(ev).await.is_err() { return; }
                             }
                         }
@@ -845,7 +848,12 @@ fn parse_iso_hhmm(s: &str) -> Option<String> {
     }
 }
 
-fn translate(msg: Message, batches: &HashMap<String, BatchInfo>, isupport: &mut ISupport) -> Vec<Event> {
+fn translate(
+    msg: Message,
+    batches: &HashMap<String, BatchInfo>,
+    isupport: &mut ISupport,
+    names_acc: &mut HashMap<String, Vec<MemberEntry>>,
+) -> Vec<Event> {
     let (nick, sender_userhost) = match &msg.prefix {
         Some(Prefix::Nickname(n, ident, host)) => {
             let uh = if !ident.is_empty() && !host.is_empty() {
@@ -936,8 +944,18 @@ fn translate(msg: Message, batches: &HashMap<String, BatchInfo>, isupport: &mut 
                 if changed { vec![Event::ISupport(isupport.clone())] } else { vec![] }
             }
             Response::RPL_NAMREPLY if args.len() >= 4 => {
+                // Accumulate; a large channel's NAMES is split across many 353
+                // lines. The list is emitted once at RPL_ENDOFNAMES (366).
                 let channel = args[2].clone();
-                let members = args[3].split_whitespace().filter_map(parse_name_entry).collect();
+                names_acc
+                    .entry(channel)
+                    .or_default()
+                    .extend(args[3].split_whitespace().filter_map(parse_name_entry));
+                vec![]
+            }
+            Response::RPL_ENDOFNAMES if args.len() >= 2 => {
+                let channel = args[1].clone();
+                let members = names_acc.remove(&channel).unwrap_or_default();
                 vec![Event::Names { channel, members }]
             }
             Response::RPL_TOPIC if args.len() >= 3 => {
@@ -1329,4 +1347,56 @@ fn unwrap_ctcp_reply(text: &str) -> Option<(String, String)> {
     }
     let a = parts.next().unwrap_or("").to_string();
     Some((q, a))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn namreply(chan: &str, names: &str) -> Message {
+        Message {
+            tags: None,
+            prefix: None,
+            command: Command::Response(
+                Response::RPL_NAMREPLY,
+                vec!["me".into(), "=".into(), chan.into(), names.into()],
+            ),
+        }
+    }
+
+    fn endofnames(chan: &str) -> Message {
+        Message {
+            tags: None,
+            prefix: None,
+            command: Command::Response(
+                Response::RPL_ENDOFNAMES,
+                vec!["me".into(), chan.into(), "End of /NAMES list".into()],
+            ),
+        }
+    }
+
+    #[test]
+    fn names_accumulate_across_353_lines_until_366() {
+        let batches = HashMap::new();
+        let mut isupport = ISupport::default();
+        let mut acc: HashMap<String, Vec<MemberEntry>> = HashMap::new();
+
+        // Each 353 emits nothing; the list builds up in the accumulator.
+        assert!(translate(namreply("#c", "@alice bob carol"), &batches, &mut isupport, &mut acc).is_empty());
+        assert!(translate(namreply("#c", "dave +erin"), &batches, &mut isupport, &mut acc).is_empty());
+
+        // The 366 emits the full, combined member list.
+        let evs = translate(endofnames("#c"), &batches, &mut isupport, &mut acc);
+        match evs.as_slice() {
+            [Event::Names { channel, members }] => {
+                assert_eq!(channel, "#c");
+                assert_eq!(members.len(), 5, "all members across both 353 lines");
+                assert!(members.iter().any(|m| m.nick == "alice" && m.prefixes == "@"));
+                assert!(members.iter().any(|m| m.nick == "erin" && m.prefixes == "+"));
+            }
+            _ => panic!("expected exactly one Names event at end of NAMES"),
+        }
+        // Accumulator is cleared so a re-query starts fresh.
+        assert!(acc.is_empty());
+    }
 }
