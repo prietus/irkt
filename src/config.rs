@@ -1,0 +1,309 @@
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Top-level config: a list of networks plus a few global UI prefs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppConfig {
+    #[serde(default, rename = "network")]
+    pub networks: Vec<NetworkConfig>,
+    #[serde(default)]
+    pub theme: Option<String>,
+    /// Extra keywords (besides your nick) that count as a highlight/mention.
+    #[serde(default)]
+    pub highlight_keywords: Vec<String>,
+    /// Nicks hidden completely from every buffer.
+    #[serde(default)]
+    pub ignored_nicks: Vec<String>,
+    /// Render inline images by default. Toggle live with `/images`.
+    #[serde(default = "default_true")]
+    pub inline_images: bool,
+    /// Render link preview cards (OpenGraph/title) by default. Toggle with `/unfurl`.
+    #[serde(default = "default_true")]
+    pub link_previews: bool,
+}
+
+/// Per-network identity + connection settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    pub name: String,
+    pub nickname: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub realname: Option<String>,
+    pub server: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default = "default_tls")]
+    pub use_tls: bool,
+    #[serde(default)]
+    pub nick_password: Option<String>,
+    #[serde(default)]
+    pub sasl_username: Option<String>,
+    #[serde(default)]
+    pub sasl_password: Option<String>,
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_cert_pass: Option<String>,
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// Buddy nicks tracked via MONITOR for online/offline presence.
+    #[serde(default)]
+    pub buddies: Vec<String>,
+    #[serde(default = "default_true")]
+    pub autoconnect: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    None,
+    NickServ,
+    SaslPlain,
+    SaslExternal,
+}
+
+impl NetworkConfig {
+    /// Auth method, derived from which credentials are set. Priority:
+    /// SASL EXTERNAL (CertFP) > SASL PLAIN > NickServ IDENTIFY.
+    pub fn auth_mode(&self) -> AuthMode {
+        if self.client_cert_path.as_deref().is_some_and(|s| !s.is_empty()) {
+            AuthMode::SaslExternal
+        } else if self.sasl_password.as_deref().is_some_and(|s| !s.is_empty()) {
+            AuthMode::SaslPlain
+        } else if self.nick_password.as_deref().is_some_and(|s| !s.is_empty()) {
+            AuthMode::NickServ
+        } else {
+            AuthMode::None
+        }
+    }
+
+    pub fn sasl_user(&self) -> &str {
+        self.sasl_username
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.nickname)
+    }
+}
+
+fn default_port() -> u16 {
+    6697
+}
+fn default_tls() -> bool {
+    true
+}
+fn default_true() -> bool {
+    true
+}
+
+pub enum LoadResult {
+    Loaded(AppConfig),
+    WroteTemplate(PathBuf),
+    Error(String),
+}
+
+pub fn config_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "irkt").map(|p| p.config_dir().join("config.toml"))
+}
+
+pub fn load() -> LoadResult {
+    let Some(path) = config_path() else {
+        return LoadResult::Error("could not resolve config directory".into());
+    };
+
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return LoadResult::Error(format!("create {}: {e}", parent.display()));
+            }
+        }
+        if let Err(e) = std::fs::write(&path, TEMPLATE) {
+            return LoadResult::Error(format!("write {}: {e}", path.display()));
+        }
+        return LoadResult::WroteTemplate(path);
+    }
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => return LoadResult::Error(format!("read {}: {e}", path.display())),
+    };
+
+    match toml::from_str::<AppConfig>(&text) {
+        Ok(cfg) => LoadResult::Loaded(cfg),
+        Err(e) => LoadResult::Error(format!("parse {}: {e}", path.display())),
+    }
+}
+
+fn atomic_write(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// Runtime state persisted to a sidecar `state.toml`, so the user's hand-written
+/// `config.toml` (with its comments) is never rewritten by the app. Currently
+/// just per-network buddy lists modified live via `/monitor`.
+pub mod state {
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    pub struct State {
+        /// network name -> buddy nicks.
+        #[serde(default)]
+        pub buddies: BTreeMap<String, Vec<String>>,
+    }
+
+    fn path() -> Option<PathBuf> {
+        super::config_path().and_then(|p| p.parent().map(|d| d.join("state.toml")))
+    }
+
+    pub fn load() -> State {
+        let Some(p) = path() else { return State::default() };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return State::default();
+        };
+        toml::from_str(&text).unwrap_or_default()
+    }
+
+    /// Persist the buddy list for one network without touching config.toml.
+    pub fn save_buddies(network: &str, buddies: &[String]) -> Result<(), String> {
+        let mut st = load();
+        st.buddies.insert(network.to_string(), buddies.to_vec());
+        let Some(p) = path() else {
+            return Err("could not resolve config dir".into());
+        };
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let body = toml::to_string_pretty(&st).map_err(|e| e.to_string())?;
+        super::atomic_write(&p, &body).map_err(|e| e.to_string())
+    }
+}
+
+const TEMPLATE: &str = r##"# irkt config
+# ====================================================================
+# A modern terminal IRC client. Each [[network]] block is a separate
+# IRC connection with its own identity and auto-join channels.
+
+[[network]]
+name = "libera"
+nickname = "YOUR_NICK"
+# username = "your_handle"     # default: same as nickname
+# realname = "Your Name"       # default: same as nickname
+server = "irc.libera.chat"
+# port = 6697                  # default: 6697 (TLS)
+# use_tls = true               # default: true
+channels = ["#rust"]
+# autoconnect = true           # default: true
+
+# === Authentication (per network) =====================================
+# Pick AT MOST ONE. Priority if multiple are set:
+#   SASL EXTERNAL (CertFP)  >  SASL PLAIN  >  NickServ IDENTIFY
+#
+# (1) NickServ IDENTIFY
+# nick_password = "your-nickserv-password"
+#
+# (2) SASL PLAIN — sasl_username defaults to your nickname.
+# sasl_username = "your-account"
+# sasl_password = "your-password"
+#
+# (3) SASL EXTERNAL / CertFP — TLS client certificate auth.
+#     openssl pkcs12 -export -inkey key.pem -in cert.pem \
+#         -out client.p12 -passout pass:something-non-empty
+#     Then: /msg NickServ CERT ADD <sha512-of-cert-DER>
+#     macOS: client_cert_pass MUST NOT be empty.
+# client_cert_path = "/absolute/path/to/client.p12"
+# client_cert_pass = "something-non-empty"
+
+# Buddies tracked via MONITOR for online/offline presence.
+# buddies = ["alice", "bob"]
+
+# Add more networks by copying the [[network]] block above.
+
+# === Global =========================================================
+# theme = "dark"
+# highlight_keywords = ["irkt"]
+# ignored_nicks = ["spammer42"]
+# inline_images = true
+# link_previews = true
+"##;
+
+/// IRCv3 Strict Transport Security policy storage.
+///
+/// Persists `(host -> StsPolicy)` in `sts.toml` next to `config.toml`. The
+/// worker parses the `sts=duration=N,port=P` CAP-LS value, calls `upsert`,
+/// and on the *next* connection attempt `get_active(host)` returns the
+/// override that should be applied to `NetworkConfig`.
+pub mod sts {
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct StsPolicy {
+        pub port: u16,
+        pub expires_at: u64,
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    struct StsFile {
+        #[serde(default)]
+        policies: HashMap<String, StsPolicy>,
+    }
+
+    fn path() -> Option<PathBuf> {
+        super::config_path().and_then(|p| p.parent().map(|d| d.join("sts.toml")))
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn load() -> StsFile {
+        let Some(p) = path() else {
+            return StsFile::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return StsFile::default();
+        };
+        toml::from_str::<StsFile>(&text).unwrap_or_default()
+    }
+
+    fn store(file: &StsFile) -> std::io::Result<()> {
+        let Some(p) = path() else {
+            return Err(std::io::Error::other("could not resolve config dir"));
+        };
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(file).map_err(std::io::Error::other)?;
+        std::fs::write(&p, text)
+    }
+
+    /// Returns the unexpired policy for `host`, if any.
+    pub fn get_active(host: &str) -> Option<StsPolicy> {
+        let file = load();
+        let key = host.to_ascii_lowercase();
+        file.policies
+            .get(&key)
+            .cloned()
+            .filter(|p| p.expires_at > now_secs())
+    }
+
+    /// Upsert a policy. `duration_secs` is added to the current time.
+    pub fn upsert(host: &str, port: u16, duration_secs: u64) -> std::io::Result<()> {
+        let mut file = load();
+        let expires_at = now_secs().saturating_add(duration_secs);
+        file.policies
+            .insert(host.to_ascii_lowercase(), StsPolicy { port, expires_at });
+        store(&file)
+    }
+}
