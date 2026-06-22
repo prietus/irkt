@@ -30,6 +30,10 @@ the [`irc`](https://crates.io/crates/irc) protocol crate, and `tokio`.
   under their parent message; reactions (`+draft/react`) show as aggregated
   emoji badges beneath the message. Pick the target message with `Alt+↑/↓` —
   `Enter` replies to it, `Alt+R` reacts (emoji via your OS picker).
+- **Themes** — `dark` (default), `light`, `nord`, and `terminal` (adapts to
+  your terminal's own palette and uses reverse-video highlights, so it stays
+  legible on any background). Switch live with `/theme <name>`; the choice
+  persists without rewriting your `config.toml`.
 - **TUI** — network/channel sidebar with unread + mention badges and buddy
   presence, member list with prefixes, topic bar, typing indicator,
   tab-completion (nicks + commands), and scrollback.
@@ -78,7 +82,7 @@ Add more `[[network]]` blocks to connect to multiple networks.
 ## Commands
 
 `/join /part /msg /query /me /nick /topic /whois /away /mode /kick /invite`
-`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /react /reply /redact /quit`
+`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /theme /react /reply /redact /quit`
 
 `/react <emoji>` and `/reply <text>` act on the **selected** message (chosen
 with `Alt+↑/↓`), or the most recent message with a server `msgid` if none is

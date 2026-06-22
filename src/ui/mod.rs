@@ -1,5 +1,6 @@
 //! Terminal rendering. A single `draw` entry point lays out the sidebar, chat
-//! view, member list, input line, and status bar from [`App`] state.
+//! view, member list, input line, and status bar from [`App`] state. Every
+//! color comes from `app.theme` (see [`crate::theme`]).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -11,37 +12,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::state::*;
 use crate::images::{extract_urls, ImageState};
+use crate::theme::Theme;
 
 /// Max columns an inline image is drawn across.
 const IMAGE_MAX_COLS: u16 = 60;
-
-/// A small, readable palette for hashing nicks to stable colors.
-const NICK_COLORS: &[Color] = &[
-    Color::LightRed,
-    Color::LightGreen,
-    Color::LightYellow,
-    Color::LightBlue,
-    Color::LightMagenta,
-    Color::LightCyan,
-    Color::Rgb(0xff, 0xa5, 0x00),
-    Color::Rgb(0x9b, 0x7e, 0xde),
-    Color::Rgb(0x4e, 0xc9, 0xb0),
-    Color::Rgb(0xd1, 0x9a, 0x66),
-];
-
-fn nick_color(nick: &str) -> Color {
-    let mut h: u32 = 2166136261;
-    for b in nick.bytes() {
-        h ^= b as u32;
-        h = h.wrapping_mul(16777619);
-    }
-    NICK_COLORS[(h as usize) % NICK_COLORS.len()]
-}
-
-const ACCENT: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
-const DIM: Color = Color::Rgb(0x6c, 0x70, 0x86);
-/// Background for the selected message (Alt+↑/↓ message cursor).
-const SEL_BG: Color = Color::Rgb(0x2d, 0x33, 0x44);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -88,9 +62,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(DIM));
+        .border_style(Style::default().fg(t.dim));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -99,47 +74,47 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
         let sel_net = ni == app.active.net;
         let dot = net.conn.glyph();
         let dot_color = match net.conn {
-            ConnState::Connected => Color::Green,
-            ConnState::Connecting | ConnState::Reconnecting => Color::Yellow,
-            ConnState::Disconnected => DIM,
-            ConnState::Error => Color::Red,
+            ConnState::Connected => t.good,
+            ConnState::Connecting | ConnState::Reconnecting => t.warn,
+            ConnState::Disconnected => t.dim,
+            ConnState::Error => t.bad,
         };
         lines.push(RLine::from(vec![
             Span::styled(format!("{dot} "), Style::default().fg(dot_color)),
             Span::styled(
                 net.cfg.name.clone(),
-                Style::default().fg(if sel_net { ACCENT } else { Color::White }).add_modifier(Modifier::BOLD),
+                Style::default().fg(if sel_net { t.accent } else { t.bright }).add_modifier(Modifier::BOLD),
             ),
         ]));
         for (bi, buf) in net.buffers.iter().enumerate() {
             let active = sel_net && bi == app.active.buf;
             let mut spans = Vec::new();
             let marker = if active { "▌" } else { " " };
-            spans.push(Span::styled(marker, Style::default().fg(ACCENT)));
+            spans.push(Span::styled(marker, Style::default().fg(t.accent)));
             let name_style = if active {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default().fg(t.bright).add_modifier(Modifier::BOLD)
             } else if buf.mentions > 0 {
-                Style::default().fg(Color::LightRed)
+                Style::default().fg(t.bad)
             } else if buf.unread > 0 {
-                Style::default().fg(Color::White)
+                Style::default().fg(t.bright)
             } else {
-                Style::default().fg(DIM)
+                Style::default().fg(t.dim)
             };
             let label = if bi == 0 { "status".to_string() } else { buf.name.clone() };
             spans.push(Span::styled(format!(" {label}"), name_style));
             if buf.mentions > 0 {
                 spans.push(Span::styled(
                     format!(" ({})", buf.mentions),
-                    Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.bad).add_modifier(Modifier::BOLD),
                 ));
             } else if buf.unread > 0 {
-                spans.push(Span::styled(format!(" ({})", buf.unread), Style::default().fg(DIM)));
+                spans.push(Span::styled(format!(" ({})", buf.unread), Style::default().fg(t.dim)));
             }
             lines.push(RLine::from(spans));
         }
         // Buddy presence (MONITOR), if any are configured.
         if !net.cfg.buddies.is_empty() {
-            lines.push(RLine::from(Span::styled("  buddies", Style::default().fg(DIM).add_modifier(Modifier::BOLD))));
+            lines.push(RLine::from(Span::styled("  buddies", Style::default().fg(t.dim).add_modifier(Modifier::BOLD))));
             let mut buddies = net.cfg.buddies.clone();
             buddies.sort_by_key(|b| {
                 let online = net.online_buddies.contains(&b.to_lowercase());
@@ -147,10 +122,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
             });
             for b in &buddies {
                 let online = net.online_buddies.contains(&b.to_lowercase());
-                let (dot, color) = if online { ('●', Color::Green) } else { ('○', DIM) };
+                let (dot, color) = if online { ('●', t.good) } else { ('○', t.dim) };
                 lines.push(RLine::from(vec![
                     Span::styled(format!("  {dot} "), Style::default().fg(color)),
-                    Span::styled(b.clone(), Style::default().fg(if online { Color::White } else { DIM })),
+                    Span::styled(b.clone(), Style::default().fg(if online { t.bright } else { t.dim })),
                 ]));
             }
         }
@@ -179,9 +154,12 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         (b.name.clone(), b.topic.clone().unwrap_or_default())
     };
     let header_line = RLine::from(vec![
-        Span::styled(format!(" {title} "), Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {title} "),
+            Style::default().fg(app.theme.header_fg).bg(app.theme.accent).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
-        Span::styled(topic, Style::default().fg(DIM)),
+        Span::styled(topic, Style::default().fg(app.theme.dim)),
     ]);
     f.render_widget(Paragraph::new(header_line), header);
 
@@ -261,6 +239,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             children: &children,
             reactions: &buf.reactions,
             selection: buf.selection.as_deref(),
+            theme: &app.theme,
             width,
             img_cols,
             inline,
@@ -325,6 +304,7 @@ struct RenderCtx<'a> {
     reactions: &'a std::collections::HashMap<String, Vec<(String, Vec<String>)>>,
     /// msgid of the currently selected message, if any.
     selection: Option<&'a str>,
+    theme: &'a Theme,
     width: usize,
     img_cols: u16,
     inline: bool,
@@ -341,19 +321,25 @@ fn push_message(
     placements: &mut Vec<(usize, u16, String)>,
     sel_range: &mut Option<(usize, usize)>,
 ) {
+    let t = ctx.theme;
     let line = &ctx.lines[idx];
     let is_selected = ctx.selection.is_some() && line.msgid.as_deref() == ctx.selection;
     let row_start = rows.len();
     let mut these = if depth == 0 {
-        render_line(line, ctx.width)
+        render_line(line, ctx.width, t)
     } else {
-        render_reply_child(line, depth, ctx.width)
+        render_reply_child(line, depth, ctx.width, t)
     };
     if is_selected {
-        // Highlight the whole message with a selection bar.
+        // Highlight the whole message — reverse-video on adaptive themes, a
+        // background bar otherwise.
         for rl in &mut these {
             for sp in &mut rl.spans {
-                sp.style = sp.style.bg(SEL_BG);
+                sp.style = if t.sel_reverse {
+                    sp.style.add_modifier(Modifier::REVERSED)
+                } else {
+                    sp.style.bg(t.sel_bg)
+                };
             }
         }
         *sel_range = Some((row_start, row_start + these.len()));
@@ -373,7 +359,7 @@ fn push_message(
                     placements.push((s, r, url));
                 }
                 Some(ImageState::Card { title, desc, host, image }) if ctx.unfurl => {
-                    rows.extend(render_card(title, desc, host, ctx.width));
+                    rows.extend(render_card(title, desc, host, ctx.width, t));
                     if ctx.inline {
                         if let Some(img) = image {
                             if let Some(ImageState::Ready { w, h, .. }) = ctx.images.map.get(img) {
@@ -401,7 +387,7 @@ fn push_message(
                 for (emoji, nicks) in rx {
                     spans.push(Span::styled(
                         format!(" {emoji} {} ", nicks.len()),
-                        Style::default().fg(Color::White).bg(Color::Rgb(0x2a, 0x2e, 0x3a)),
+                        Style::default().fg(t.badge_fg).bg(t.badge_bg),
                     ));
                     spans.push(Span::raw(" "));
                 }
@@ -421,16 +407,16 @@ fn push_message(
 }
 
 /// Render a threaded reply as a nested `↳ author: text` line under its parent.
-fn render_reply_child(line: &Line, depth: usize, width: usize) -> Vec<RLine<'static>> {
+fn render_reply_child(line: &Line, depth: usize, width: usize, t: &Theme) -> Vec<RLine<'static>> {
     let indent = 6 + depth.saturating_sub(1) * 2;
     let author = line.from.clone();
     let arrow = "↳ ";
     let head = format!("{author}: ");
     let prefix_len = indent + arrow.width() + head.width();
     let avail = width.saturating_sub(prefix_len).max(8);
-    let mut style = Style::default().fg(Color::Rgb(0xc0, 0xc5, 0xce));
+    let mut style = Style::default().fg(t.text);
     if line.highlight {
-        style = style.bg(Color::Rgb(0x3a, 0x2f, 0x1a)).add_modifier(Modifier::BOLD);
+        style = mention_style(style, t);
     }
     let wrapped = wrap_text(&line.text, avail);
     let cont = " ".repeat(prefix_len);
@@ -439,8 +425,8 @@ fn render_reply_child(line: &Line, depth: usize, width: usize) -> Vec<RLine<'sta
         if i == 0 {
             out.push(RLine::from(vec![
                 Span::raw(" ".repeat(indent)),
-                Span::styled(arrow.to_string(), Style::default().fg(DIM)),
-                Span::styled(head.clone(), Style::default().fg(nick_color(&author)).add_modifier(Modifier::BOLD)),
+                Span::styled(arrow.to_string(), Style::default().fg(t.dim)),
+                Span::styled(head.clone(), Style::default().fg(t.nick(&author)).add_modifier(Modifier::BOLD)),
                 Span::styled(seg.clone(), style),
             ]));
         } else {
@@ -450,15 +436,25 @@ fn render_reply_child(line: &Line, depth: usize, width: usize) -> Vec<RLine<'sta
     if out.is_empty() {
         out.push(RLine::from(vec![
             Span::raw(" ".repeat(indent)),
-            Span::styled(arrow.to_string(), Style::default().fg(DIM)),
-            Span::styled(head, Style::default().fg(nick_color(&author)).add_modifier(Modifier::BOLD)),
+            Span::styled(arrow.to_string(), Style::default().fg(t.dim)),
+            Span::styled(head, Style::default().fg(t.nick(&author)).add_modifier(Modifier::BOLD)),
         ]));
     }
     out
 }
 
+/// Apply the mention highlight: reverse-video on adaptive themes, a tinted
+/// background otherwise.
+fn mention_style(style: Style, t: &Theme) -> Style {
+    if t.mention_reverse {
+        style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        style.bg(t.mention_bg).add_modifier(Modifier::BOLD)
+    }
+}
+
 /// Format one buffer line into one or more wrapped terminal rows.
-fn render_line(line: &Line, width: usize) -> Vec<RLine<'static>> {
+fn render_line(line: &Line, width: usize, t: &Theme) -> Vec<RLine<'static>> {
     let time = if line.time.is_empty() {
         "     ".to_string()
     } else {
@@ -469,39 +465,39 @@ fn render_line(line: &Line, width: usize) -> Vec<RLine<'static>> {
         LineKind::Message => {
             let nick = &line.from;
             let g = vec![
-                Span::styled(format!("{time} "), Style::default().fg(DIM)),
-                Span::styled(format!("{nick} "), Style::default().fg(nick_color(nick)).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{time} "), Style::default().fg(t.dim)),
+                Span::styled(format!("{nick} "), Style::default().fg(t.nick(nick)).add_modifier(Modifier::BOLD)),
             ];
-            (g, time.width() + 1 + nick.width() + 1, Style::default().fg(Color::Rgb(0xc0, 0xc5, 0xce)))
+            (g, time.width() + 1 + nick.width() + 1, Style::default().fg(t.text))
         }
         LineKind::Self_ => {
             let nick = &line.from;
             let g = vec![
-                Span::styled(format!("{time} "), Style::default().fg(DIM)),
-                Span::styled(format!("{nick} "), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{time} "), Style::default().fg(t.dim)),
+                Span::styled(format!("{nick} "), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
             ];
-            (g, time.width() + 1 + nick.width() + 1, Style::default().fg(Color::White))
+            (g, time.width() + 1 + nick.width() + 1, Style::default().fg(t.bright))
         }
         LineKind::Action => {
             let nick = &line.from;
             let g = vec![
-                Span::styled(format!("{time} "), Style::default().fg(DIM)),
-                Span::styled(format!("* {nick} "), Style::default().fg(Color::LightMagenta)),
+                Span::styled(format!("{time} "), Style::default().fg(t.dim)),
+                Span::styled(format!("* {nick} "), Style::default().fg(t.special)),
             ];
-            (g, time.width() + 1 + 2 + nick.width() + 1, Style::default().fg(Color::LightMagenta))
+            (g, time.width() + 1 + 2 + nick.width() + 1, Style::default().fg(t.special))
         }
         LineKind::Notice => {
             let from = &line.from;
             let g = vec![
-                Span::styled(format!("{time} "), Style::default().fg(DIM)),
-                Span::styled(format!("-{from}- "), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("{time} "), Style::default().fg(t.dim)),
+                Span::styled(format!("-{from}- "), Style::default().fg(t.warn)),
             ];
-            (g, time.width() + 1 + from.width() + 3, Style::default().fg(Color::Yellow))
+            (g, time.width() + 1 + from.width() + 3, Style::default().fg(t.warn))
         }
-        LineKind::Join => simple_system(&time, "→", Color::Green),
-        LineKind::Part => simple_system(&time, "←", Color::Rgb(0xb0, 0x60, 0x60)),
-        LineKind::Quit => simple_system(&time, "⤫", DIM),
-        LineKind::System => simple_system(&time, "·", DIM),
+        LineKind::Join => simple_system(&time, "→", t.good, t.dim),
+        LineKind::Part => simple_system(&time, "←", t.part, t.dim),
+        LineKind::Quit => simple_system(&time, "⤫", t.dim, t.dim),
+        LineKind::System => simple_system(&time, "·", t.dim, t.dim),
     };
 
     let avail = width.saturating_sub(prefix_len).max(8);
@@ -510,7 +506,7 @@ fn render_line(line: &Line, width: usize) -> Vec<RLine<'static>> {
     let pad = " ".repeat(prefix_len);
     let mut style = text_style;
     if line.highlight {
-        style = style.bg(Color::Rgb(0x3a, 0x2f, 0x1a)).add_modifier(Modifier::BOLD);
+        style = mention_style(style, t);
     }
     for (i, seg) in wrapped.iter().enumerate() {
         let mut spans: Vec<Span<'static>> = if i == 0 {
@@ -529,8 +525,8 @@ fn render_line(line: &Line, width: usize) -> Vec<RLine<'static>> {
 
 /// Render an unfurled link card as a small accent-barred block: title (bold),
 /// wrapped description (dim), and host (faint).
-fn render_card(title: &str, desc: &str, host: &str, width: usize) -> Vec<RLine<'static>> {
-    let bar = Span::styled("▏", Style::default().fg(ACCENT));
+fn render_card(title: &str, desc: &str, host: &str, width: usize, t: &Theme) -> Vec<RLine<'static>> {
+    let bar = Span::styled("▏", Style::default().fg(t.accent));
     let indent = 8usize; // align roughly under the message body
     let pad = " ".repeat(indent);
     let avail = width.saturating_sub(indent + 2).max(8);
@@ -545,27 +541,27 @@ fn render_card(title: &str, desc: &str, host: &str, width: usize) -> Vec<RLine<'
     if !title.is_empty() {
         for (i, seg) in wrap_text(title, avail).into_iter().enumerate().take(2) {
             let style = if i == 0 {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default().fg(t.bright).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                Style::default().fg(t.bright)
             };
             push(vec![Span::styled(seg, style)]);
         }
     }
     if !desc.is_empty() {
         for seg in wrap_text(desc, avail).into_iter().take(3) {
-            push(vec![Span::styled(seg, Style::default().fg(Color::Rgb(0x9a, 0x9f, 0xb0)))]);
+            push(vec![Span::styled(seg, Style::default().fg(t.card_desc))]);
         }
     }
     if !host.is_empty() {
-        push(vec![Span::styled(host.to_string(), Style::default().fg(DIM).add_modifier(Modifier::ITALIC))]);
+        push(vec![Span::styled(host.to_string(), Style::default().fg(t.dim).add_modifier(Modifier::ITALIC))]);
     }
     out
 }
 
-fn simple_system(time: &str, glyph: &str, color: Color) -> (Vec<Span<'static>>, usize, Style) {
+fn simple_system(time: &str, glyph: &str, color: Color, dim: Color) -> (Vec<Span<'static>>, usize, Style) {
     let g = vec![
-        Span::styled(format!("{time} "), Style::default().fg(DIM)),
+        Span::styled(format!("{time} "), Style::default().fg(dim)),
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
     ];
     (g, time.width() + 1 + glyph.width() + 1, Style::default().fg(color))
@@ -620,9 +616,10 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn draw_members(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let block = Block::default()
         .borders(Borders::LEFT)
-        .border_style(Style::default().fg(DIM));
+        .border_style(Style::default().fg(t.dim));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -641,19 +638,19 @@ fn draw_members(f: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<RLine> = Vec::new();
     lines.push(RLine::from(Span::styled(
         format!("{} members", sorted.len()),
-        Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+        Style::default().fg(t.dim).add_modifier(Modifier::BOLD),
     )));
     for m in &sorted {
         let prefix = m.prefixes.chars().next().unwrap_or(' ');
         let pcolor = match prefix {
-            '~' | '&' | '@' => Color::LightRed,
-            '%' => Color::Yellow,
-            '+' => Color::Green,
-            _ => DIM,
+            '~' | '&' | '@' => t.bad,
+            '%' => t.warn,
+            '+' => t.good,
+            _ => t.dim,
         };
         lines.push(RLine::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(pcolor)),
-            Span::styled(m.nick.clone(), Style::default().fg(nick_color(&m.nick))),
+            Span::styled(m.nick.clone(), Style::default().fg(t.nick(&m.nick))),
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -671,6 +668,7 @@ fn prefix_rank(prefixes: &str) -> u8 {
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let target = app.active_target().unwrap_or_default();
     // The author the current action targets: the selected message, or the most
     // recent one with a msgid.
@@ -684,12 +682,12 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
             Some(w) => format!("[react → {w}] "),
             None => format!("[react {target}] "),
         };
-        (label, Color::Yellow)
+        (label, t.warn)
     } else if let Some(from) = app.active_buffer().and_then(|b| b.selected_from()) {
         // A message is selected: the prompt shows the reply target.
-        (format!("[{target} → {from}] "), Color::LightMagenta)
+        (format!("[{target} → {from}] "), t.special)
     } else {
-        (format!("[{target}] "), ACCENT)
+        (format!("[{target}] "), t.accent)
     };
     let prompt_w = prompt.width();
     let line = RLine::from(vec![
@@ -704,6 +702,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    let t = &app.theme;
     let mut spans = Vec::new();
     if let Some(buf) = app.active_buffer() {
         if !buf.typing.is_empty() {
@@ -713,22 +712,22 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 format!(" {} are typing… ", buf.typing.len())
             };
-            spans.push(Span::styled(txt, Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(txt, Style::default().fg(t.warn)));
         }
     }
     if let Some(msg) = &app.status_msg {
-        spans.push(Span::styled(format!(" {msg} "), Style::default().fg(Color::Black).bg(Color::Yellow)));
+        spans.push(Span::styled(format!(" {msg} "), Style::default().fg(t.header_fg).bg(t.warn)));
     }
     if spans.is_empty() {
         let net = app.active_net().map(|n| n.cfg.name.as_str()).unwrap_or("-");
         let nick = app.active_net().map(|n| n.nick.as_str()).unwrap_or("-");
         spans.push(Span::styled(
             format!(" irkt · {net} · {nick}  —  ^N/^P switch · ⌥↑↓ select · ⌥R react · Tab complete · ^C quit"),
-            Style::default().fg(DIM),
+            Style::default().fg(t.dim),
         ));
     }
     f.render_widget(
-        Paragraph::new(RLine::from(spans)).style(Style::default().bg(Color::Rgb(0x16, 0x18, 0x22))),
+        Paragraph::new(RLine::from(spans)).style(Style::default().bg(t.statusbar_bg)),
         area,
     );
 }
@@ -848,5 +847,49 @@ mod render_tests {
         // The input prompt shows the reply target.
         assert!(screen.contains("→ alice"), "prompt shows the reply target chip");
         assert!(screen.contains("yes! here"), "composed text shown");
+    }
+
+    fn render_with_theme(theme: crate::theme::Theme) -> Terminal<TestBackend> {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        app.networks[0].buffers[bi].push(Line {
+            time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
+            text: "selected line".into(), msgid: Some("p1".into()), highlight: false, reply_to: None,
+        });
+        app.networks[0].buffers[bi].selection = Some("p1".into());
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = false;
+        app.theme = theme;
+        let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        term
+    }
+
+    #[test]
+    fn selection_highlight_respects_theme() {
+        // The `terminal` theme uses reverse-video (legible on any background).
+        let term = render_with_theme(crate::theme::terminal());
+        let buf = term.backend().buffer();
+        let area = *buf.area();
+        let any_reversed = (0..area.height).any(|y| {
+            (0..area.width).any(|x| buf[(x, y)].style().add_modifier.contains(Modifier::REVERSED))
+        });
+        assert!(any_reversed, "terminal theme selects with reverse-video");
+
+        // The `dark` theme paints an explicit selection background.
+        let term = render_with_theme(crate::theme::dark());
+        let buf = term.backend().buffer();
+        let area = *buf.area();
+        let sel_bg = crate::theme::dark().sel_bg;
+        let any_sel_bg = (0..area.height).any(|y| {
+            (0..area.width).any(|x| buf[(x, y)].style().bg == Some(sel_bg))
+        });
+        assert!(any_sel_bg, "dark theme selects with a background bar");
     }
 }

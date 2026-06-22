@@ -3,6 +3,7 @@ mod config;
 mod images;
 mod irc;
 mod keys;
+mod theme;
 mod ui;
 
 use std::io::{self, Stdout};
@@ -88,6 +89,10 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
     let saved = config::state::load();
 
     let mut app = App::new(cfg.clone(), images);
+    // A theme picked live with /theme (sidecar) overrides config.toml.
+    if let Some(name) = &saved.theme {
+        app.theme = theme::Theme::by_name(name);
+    }
     for (id, net_cfg) in cfg.networks.iter().enumerate() {
         if !net_cfg.autoconnect {
             continue;

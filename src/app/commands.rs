@@ -258,6 +258,24 @@ impl App {
                 let s = if self.inline_images { "on" } else { "off" };
                 self.set_status(format!("inline images {s}"));
             }
+            "theme" => {
+                if rest.is_empty() {
+                    let names = crate::theme::Theme::NAMES.join(", ");
+                    self.set_status(format!("theme: {} (available: {names})", self.theme.name));
+                    return;
+                }
+                let name = rest.split_whitespace().next().unwrap();
+                if !crate::theme::Theme::NAMES.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                    self.set_status(format!("unknown theme '{name}' (try: {})", crate::theme::Theme::NAMES.join(", ")));
+                    return;
+                }
+                self.theme = crate::theme::Theme::by_name(name);
+                if let Err(e) = crate::config::state::save_theme(self.theme.name) {
+                    self.set_status(format!("theme set (not saved: {e})"));
+                } else {
+                    self.set_status(format!("theme: {}", self.theme.name));
+                }
+            }
             "unfurl" => {
                 self.link_previews = match rest {
                     "on" => true,

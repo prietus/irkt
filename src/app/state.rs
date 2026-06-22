@@ -3,6 +3,7 @@
 use crate::config::{AppConfig, NetworkConfig};
 use crate::images::Images;
 use crate::irc::{ISupport, MemberEntry, OutgoingTx};
+use crate::theme::Theme;
 
 pub type NetId = usize;
 
@@ -284,6 +285,8 @@ pub struct App {
     pub completion: Option<Completion>,
     /// Inline-image fetch cache + terminal-graphics picker.
     pub images: Images,
+    /// Active color theme.
+    pub theme: Theme,
 }
 
 pub struct Completion {
@@ -297,6 +300,7 @@ impl App {
     pub fn new(config: AppConfig, images: Images) -> Self {
         let inline_images = config.inline_images;
         let link_previews = config.link_previews;
+        let theme = Theme::by_name(config.theme.as_deref().unwrap_or("dark"));
         App {
             config,
             networks: Vec::new(),
@@ -312,6 +316,7 @@ impl App {
             status_msg: None,
             completion: None,
             images,
+            theme,
         }
     }
 

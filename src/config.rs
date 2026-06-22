@@ -155,6 +155,9 @@ pub mod state {
         /// network name -> buddy nicks.
         #[serde(default)]
         pub buddies: BTreeMap<String, Vec<String>>,
+        /// Active theme chosen live with `/theme` (overrides config.toml).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub theme: Option<String>,
     }
 
     fn path() -> Option<PathBuf> {
@@ -173,13 +176,24 @@ pub mod state {
     pub fn save_buddies(network: &str, buddies: &[String]) -> Result<(), String> {
         let mut st = load();
         st.buddies.insert(network.to_string(), buddies.to_vec());
+        store(&st)
+    }
+
+    /// Persist the chosen theme without touching config.toml.
+    pub fn save_theme(theme: &str) -> Result<(), String> {
+        let mut st = load();
+        st.theme = Some(theme.to_string());
+        store(&st)
+    }
+
+    fn store(st: &State) -> Result<(), String> {
         let Some(p) = path() else {
             return Err("could not resolve config dir".into());
         };
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let body = toml::to_string_pretty(&st).map_err(|e| e.to_string())?;
+        let body = toml::to_string_pretty(st).map_err(|e| e.to_string())?;
         super::atomic_write(&p, &body).map_err(|e| e.to_string())
     }
 }
@@ -225,6 +239,9 @@ channels = ["#rust"]
 # Add more networks by copying the [[network]] block above.
 
 # === Global =========================================================
+# Color theme: "dark" (default), "light", "terminal" (adapts to your
+# terminal's palette — best legibility on unusual themes), or "nord".
+# Switch live with /theme <name>.
 # theme = "dark"
 # highlight_keywords = ["irkt"]
 # ignored_nicks = ["spammer42"]

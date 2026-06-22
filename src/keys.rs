@@ -222,5 +222,5 @@ fn apply_tab(app: &mut App) {
 const COMMANDS: &[&str] = &[
     "join", "part", "msg", "query", "me", "nick", "topic", "whois", "away", "mode", "kick",
     "invite", "raw", "names", "monitor", "buddy", "setname", "close", "server", "images",
-    "unfurl", "react", "reply", "redact", "quit", "help",
+    "unfurl", "theme", "react", "reply", "redact", "quit", "help",
 ];
