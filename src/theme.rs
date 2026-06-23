@@ -39,8 +39,39 @@ pub struct Theme {
     pub special: Color,
     /// Parts / quits.
     pub part: Color,
-    /// Palette nicks are hashed into.
-    pub nicks: Vec<Color>,
+    /// How per-nick colors are assigned.
+    pub nicks: NickColors,
+}
+
+/// Strategy for coloring nicks.
+#[derive(Clone, Debug)]
+pub enum NickColors {
+    /// A fixed palette nicks are hashed into. Used by the `terminal` theme,
+    /// which is limited to ANSI named colors and so can't span a hue wheel.
+    Palette(Vec<Color>),
+    /// Procedural: hash the nick to a hue across the whole color wheel at a
+    /// fixed saturation/lightness tuned to the theme's background. With 360
+    /// possible hues instead of a 10-slot palette, distinct speakers almost
+    /// never collide. `sat`/`light` are 0.0–1.0.
+    Hsl { sat: f32, light: f32 },
+}
+
+/// HSL → RGB. `h` is degrees (0–360), `s`/`l` are 0.0–1.0.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Color::Rgb(to(r1), to(g1), to(b1))
 }
 
 impl Theme {
@@ -61,7 +92,10 @@ impl Theme {
             h ^= b as u32;
             h = h.wrapping_mul(16777619);
         }
-        self.nicks[(h as usize) % self.nicks.len()]
+        match &self.nicks {
+            NickColors::Palette(p) => p[(h as usize) % p.len()],
+            NickColors::Hsl { sat, light } => hsl_to_rgb((h % 360) as f32, *sat, *light),
+        }
     }
 }
 
@@ -91,12 +125,8 @@ pub fn dark() -> Theme {
         bad: rgb(0xf7, 0x76, 0x8e),
         special: rgb(0xbb, 0x9a, 0xf7),
         part: rgb(0xb0, 0x60, 0x60),
-        nicks: vec![
-            rgb(0xf7, 0x76, 0x8e), rgb(0x9e, 0xce, 0x6a), rgb(0xe0, 0xaf, 0x68),
-            rgb(0x7a, 0xa2, 0xf7), rgb(0xbb, 0x9a, 0xf7), rgb(0x7d, 0xcf, 0xff),
-            rgb(0xff, 0xa5, 0x00), rgb(0x9b, 0x7e, 0xde), rgb(0x4e, 0xc9, 0xb0),
-            rgb(0xd1, 0x9a, 0x66),
-        ],
+        // Bright pastel hues, legible on the dark background.
+        nicks: NickColors::Hsl { sat: 0.58, light: 0.68 },
     }
 }
 
@@ -122,12 +152,8 @@ pub fn light() -> Theme {
         bad: rgb(0xc0, 0x2a, 0x2a),
         special: rgb(0x8a, 0x3c, 0xc0),
         part: rgb(0xa0, 0x50, 0x50),
-        nicks: vec![
-            rgb(0xc0, 0x2a, 0x2a), rgb(0x1a, 0x7f, 0x37), rgb(0x96, 0x66, 0x00),
-            rgb(0x20, 0x4a, 0xc0), rgb(0x8a, 0x3c, 0xc0), rgb(0x0a, 0x6e, 0x8a),
-            rgb(0xb5, 0x5a, 0x00), rgb(0x5a, 0x44, 0xa0), rgb(0x0a, 0x7a, 0x6a),
-            rgb(0x8a, 0x55, 0x22),
-        ],
+        // Darker, saturated hues so nicks stay readable on a white background.
+        nicks: NickColors::Hsl { sat: 0.72, light: 0.40 },
     }
 }
 
@@ -154,11 +180,12 @@ pub fn terminal() -> Theme {
         bad: Color::Red,
         special: Color::Magenta,
         part: Color::Red,
-        nicks: vec![
+        // ANSI-only terminal: stuck with named colors, so a fixed palette.
+        nicks: NickColors::Palette(vec![
             Color::LightRed, Color::LightGreen, Color::LightYellow, Color::LightBlue,
             Color::LightMagenta, Color::LightCyan, Color::Red, Color::Green,
-            Color::Yellow, Color::Cyan,
-        ],
+            Color::Yellow, Color::Cyan, Color::Blue, Color::Magenta,
+        ]),
     }
 }
 
@@ -184,11 +211,34 @@ pub fn nord() -> Theme {
         bad: rgb(0xbf, 0x61, 0x6a),
         special: rgb(0xb4, 0x8e, 0xad),
         part: rgb(0xbf, 0x61, 0x6a),
-        nicks: vec![
-            rgb(0xbf, 0x61, 0x6a), rgb(0xa3, 0xbe, 0x8c), rgb(0xeb, 0xcb, 0x8b),
-            rgb(0x81, 0xa1, 0xc1), rgb(0xb4, 0x8e, 0xad), rgb(0x88, 0xc0, 0xd0),
-            rgb(0xd0, 0x87, 0x70), rgb(0x5e, 0x81, 0xac), rgb(0x8f, 0xbc, 0xbb),
-            rgb(0xe5, 0xe9, 0xf0),
-        ],
+        // Softer, less saturated to keep the cool Nord feel.
+        nicks: NickColors::Hsl { sat: 0.45, light: 0.66 },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hsl_primaries() {
+        // Pure hues at S=1, L=0.5 land on the RGB primaries.
+        assert_eq!(hsl_to_rgb(0.0, 1.0, 0.5), Color::Rgb(255, 0, 0));
+        assert_eq!(hsl_to_rgb(120.0, 1.0, 0.5), Color::Rgb(0, 255, 0));
+        assert_eq!(hsl_to_rgb(240.0, 1.0, 0.5), Color::Rgb(0, 0, 255));
+    }
+
+    #[test]
+    fn distinct_nicks_rarely_collide() {
+        // The old 10-slot palette collided constantly; the hue wheel should give
+        // a typical channel's worth of speakers near-unique colors.
+        let t = dark();
+        let nicks = [
+            "alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi",
+            "ivan", "judy", "mallory", "oscar",
+        ];
+        let colors: std::collections::HashSet<_> =
+            nicks.iter().map(|n| format!("{:?}", t.nick(n))).collect();
+        assert!(colors.len() >= nicks.len() - 1, "too many collisions: {colors:?}");
     }
 }

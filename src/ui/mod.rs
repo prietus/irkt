@@ -16,6 +16,9 @@ use crate::theme::Theme;
 
 /// Max columns an inline image is drawn across.
 const IMAGE_MAX_COLS: u16 = 60;
+/// Left indent for inline images / card thumbnails, so they sit under the
+/// message body (matching the link-card text indent) rather than flush-left.
+const IMAGE_INDENT: u16 = 8;
 /// A link-card's og:image is only a thumbnail, so it's drawn much smaller than
 /// a directly-pasted image: narrow and capped to a few rows.
 const CARD_THUMB_COLS: u16 = 22;
@@ -309,9 +312,11 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         let vis_bot = rend.min(end);
         let y = body.y + (vis_top - start) as u16;
         let height = (vis_bot - vis_top) as u16;
-        // Left-align the image with the message text.
-        let w = cols.min(body.width);
-        let rect = Rect { x: body.x, y, width: w, height };
+        // Indent the image to sit under the message body (matching the card
+        // text indent), rather than flush-left or centered.
+        let indent = IMAGE_INDENT.min(body.width.saturating_sub(1));
+        let w = cols.min(body.width.saturating_sub(indent));
+        let rect = Rect { x: body.x + indent, y, width: w, height };
         if let Some(ImageState::Ready { proto, .. }) = app.images.map.get_mut(&url) {
             f.render_stateful_widget(
                 StatefulImage::default().resize(Resize::Fit(None)),
