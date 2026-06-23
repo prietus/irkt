@@ -117,6 +117,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+
+    reconcile_typing(app, &key, ctrl, alt);
+}
+
+/// Reflect the composer state to the active channel via `draft/typing`: announce
+/// `active` (throttled) while editing a real message, and `done` once the input
+/// is empty, a `/command`, or we're in react mode.
+fn reconcile_typing(app: &mut App, key: &KeyEvent, ctrl: bool, alt: bool) {
+    let composing_msg = !app.input.is_empty() && !app.input.starts_with('/') && !app.react_mode;
+    let editing = matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+        || (matches!(key.code, KeyCode::Char(_)) && !ctrl && !alt);
+    if composing_msg && editing {
+        app.notify_typing();
+    } else if !composing_msg {
+        app.stop_typing();
+    }
 }
 
 fn scroll(app: &mut App, delta: i32) {

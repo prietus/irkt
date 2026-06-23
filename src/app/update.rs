@@ -489,6 +489,57 @@ impl App {
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_msg = Some(msg.into());
     }
+
+    /// Announce to the active channel/query that we're composing a message
+    /// (`draft/typing` `+typing=active`), throttled to once per 3s per the
+    /// spec. No-op in the status buffer, or when the network can't carry it.
+    pub fn notify_typing(&mut self) {
+        let ni = self.active.net;
+        let Some(net) = self.networks.get(ni) else { return };
+        // Typing tags ride on message-tags; respect CLIENTTAGDENY.
+        if !net.caps.iter().any(|c| c == "message-tags") {
+            return;
+        }
+        if net.isupport.client_tag_denied("typing") {
+            return;
+        }
+        let Some(buf) = self.active_buffer() else { return };
+        if matches!(buf.kind, BufferKind::Status) {
+            return;
+        }
+        let target = buf.name.clone();
+        let now = std::time::Instant::now();
+        let fresh = self
+            .typing_throttle
+            .map(|t| now.duration_since(t).as_secs() >= 3)
+            .unwrap_or(true);
+        if !fresh {
+            return;
+        }
+        self.typing_throttle = Some(now);
+        let _ = self.networks[ni].out.try_send(Outgoing::Typing {
+            target,
+            state: TypingState::Active,
+        });
+    }
+
+    /// Tell the active target we've stopped typing (`+typing=done`). No-op
+    /// unless we'd previously announced active.
+    pub fn stop_typing(&mut self) {
+        if self.typing_throttle.take().is_none() {
+            return;
+        }
+        let ni = self.active.net;
+        let Some(buf) = self.active_buffer() else { return };
+        if matches!(buf.kind, BufferKind::Status) {
+            return;
+        }
+        let target = buf.name.clone();
+        let _ = self.networks[ni].out.try_send(Outgoing::Typing {
+            target,
+            state: TypingState::Done,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -794,6 +845,72 @@ mod tests {
         });
         assert_eq!(app.networks[0].nick, "me2");
         assert_eq!(app.networks[0].buffers[quiet].lines.len(), before + 1);
+    }
+
+    /// Build an app whose single network's outgoing channel we can read.
+    fn app_with_outbox() -> (App, mpsc::Receiver<Outgoing>) {
+        let (img_tx, _r) = mpsc::channel(1);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let cfg = NetworkConfig {
+            name: "t".into(), nickname: "me".into(), username: None, realname: None,
+            server: "s".into(), port: 6697, use_tls: true, nick_password: None,
+            sasl_username: None, sasl_password: None, client_cert_path: None,
+            client_cert_pass: None, channels: vec![], buddies: vec![], autoconnect: true,
+        };
+        let (out, out_rx) = mpsc::channel(8);
+        std::mem::forget(_r);
+        app.networks.push(Network::new(0, cfg, out));
+        (app, out_rx)
+    }
+
+    #[test]
+    fn typing_sends_active_then_done() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].caps = vec!["message-tags".into()];
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.active = ActiveBuffer { net: 0, buf: bi };
+
+        app.notify_typing();
+        match out_rx.try_recv() {
+            Ok(Outgoing::Typing { target, state }) => {
+                assert_eq!(target, "#c");
+                assert_eq!(state.as_str(), "active");
+            }
+            _ => panic!("expected active typing"),
+        }
+        // Throttled: an immediate second notify stays quiet (spec: ≤ once/3s).
+        app.notify_typing();
+        assert!(out_rx.try_recv().is_err(), "second notify within 3s is throttled");
+
+        app.stop_typing();
+        match out_rx.try_recv() {
+            Ok(Outgoing::Typing { state, .. }) => assert_eq!(state.as_str(), "done"),
+            _ => panic!("expected done typing"),
+        }
+        // Already stopped: nothing more on the wire.
+        app.stop_typing();
+        assert!(out_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn no_typing_without_message_tags() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        // No message-tags cap negotiated.
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.notify_typing();
+        assert!(out_rx.try_recv().is_err(), "no typing tag without message-tags");
+    }
+
+    #[test]
+    fn no_typing_in_status_buffer() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].caps = vec!["message-tags".into()];
+        // Active buffer is the status buffer (index 0).
+        app.active = ActiveBuffer { net: 0, buf: 0 };
+        app.notify_typing();
+        assert!(out_rx.try_recv().is_err(), "never announce typing in the status buffer");
     }
 
     #[test]

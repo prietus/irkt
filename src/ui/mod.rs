@@ -16,6 +16,10 @@ use crate::theme::Theme;
 
 /// Max columns an inline image is drawn across.
 const IMAGE_MAX_COLS: u16 = 60;
+/// A link-card's og:image is only a thumbnail, so it's drawn much smaller than
+/// a directly-pasted image: narrow and capped to a few rows.
+const CARD_THUMB_COLS: u16 = 22;
+const CARD_THUMB_MAX_ROWS: u16 = 6;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -207,7 +211,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     // message rather than shown in their own chronological position; lines
     // with a ready image reserve blank rows the image is later drawn over.
     let mut rows: Vec<RLine<'static>> = Vec::new();
-    let mut placements: Vec<(usize, u16, String)> = Vec::new();
+    // (row_start, height_rows, width_cols, url)
+    let mut placements: Vec<(usize, u16, u16, String)> = Vec::new();
     let mut sel_range: Option<(usize, usize)> = None;
     {
         let buf = &app.networks[ni].buffers[bi];
@@ -282,7 +287,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(visible), body);
 
     // Draw any images whose reserved rows are within the visible window.
-    for (rstart, h, url) in placements {
+    for (rstart, h, cols, url) in placements {
         let rend = rstart + h as usize;
         if rend <= start || rstart >= end {
             continue;
@@ -291,7 +296,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         let vis_bot = rend.min(end);
         let y = body.y + (vis_top - start) as u16;
         let height = (vis_bot - vis_top) as u16;
-        let rect = Rect { x: body.x, y, width: img_cols.min(body.width), height };
+        let rect = Rect { x: body.x, y, width: cols.min(body.width), height };
         if let Some(ImageState::Ready { proto, .. }) = app.images.map.get_mut(&url) {
             f.render_stateful_widget(
                 StatefulImage::default().resize(Resize::Fit(None)),
@@ -325,7 +330,7 @@ fn push_message(
     idx: usize,
     depth: usize,
     rows: &mut Vec<RLine<'static>>,
-    placements: &mut Vec<(usize, u16, String)>,
+    placements: &mut Vec<(usize, u16, u16, String)>,
     sel_range: &mut Option<(usize, usize)>,
 ) {
     let t = ctx.theme;
@@ -363,19 +368,25 @@ fn push_message(
                     for _ in 0..r {
                         rows.push(RLine::from(""));
                     }
-                    placements.push((s, r, url));
+                    placements.push((s, r, ctx.img_cols, url));
                 }
                 Some(ImageState::Card { title, desc, host, image }) if ctx.unfurl => {
                     rows.extend(render_card(title, desc, host, ctx.width, t));
                     if ctx.inline {
                         if let Some(img) = image {
                             if let Some(ImageState::Ready { w, h, .. }) = ctx.images.map.get(img) {
-                                let r = ctx.images.rows_for(*w, *h, ctx.img_cols);
+                                // A card thumbnail: narrow and height-capped, so a
+                                // link preview never balloons to a full image.
+                                let cols = CARD_THUMB_COLS.min(ctx.img_cols);
+                                let r = ctx
+                                    .images
+                                    .rows_for(*w, *h, cols)
+                                    .min(CARD_THUMB_MAX_ROWS);
                                 let s = rows.len();
                                 for _ in 0..r {
                                     rows.push(RLine::from(""));
                                 }
-                                placements.push((s, r, img.clone()));
+                                placements.push((s, r, cols, img.clone()));
                             }
                         }
                     }

@@ -298,6 +298,9 @@ pub struct App {
     /// When true, the composer's next submission is an emoji reaction to the
     /// selected (or last) message rather than a normal message.
     pub react_mode: bool,
+    /// Last time we sent a `+typing=active` notification, to throttle to the
+    /// spec's "at most every 3s". `None` means we're not currently typing.
+    pub typing_throttle: Option<std::time::Instant>,
     /// Transient status-bar message.
     pub status_msg: Option<String>,
     /// Tab-completion state: (anchor byte offset, candidates, index).
@@ -338,6 +341,7 @@ impl App {
             uploading: false,
             up_tx: None,
             react_mode: false,
+            typing_throttle: None,
             status_msg: None,
             completion: None,
             images,
