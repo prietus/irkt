@@ -34,6 +34,14 @@ the [`irc`](https://crates.io/crates/irc) protocol crate, and `tokio`.
   your terminal's own palette and uses reverse-video highlights, so it stays
   legible on any background). Switch live with `/theme <name>`; the choice
   persists without rewriting your `config.toml`.
+- **File uploads** — `/upload <path>` posts a file and drops the resulting
+  URL into the composer. Uses the IRC server's advertised **FILEHOST**
+  endpoint (`soju.im/FILEHOST`, authenticated with your SASL credentials) by
+  default, or a **custom HTTP uploader** (pastebin / `0x0`-style) configured
+  under `[upload.custom]`.
+- **Quiet busy channels** — hide join/part/quit churn with `/joins` (or
+  `hide_join_part` in config), and "*nick* is now known as …" lines only show
+  for people who have actually spoken recently, not silent lurkers.
 - **TUI** — network/channel sidebar with unread + mention badges and buddy
   presence, member list with prefixes, topic bar, typing indicator,
   tab-completion (nicks + commands), and scrollback.
@@ -67,7 +75,7 @@ Add more `[[network]]` blocks to connect to multiple networks.
 | Key | Action |
 |-----|--------|
 | `Enter` | send message / run command |
-| `Tab` | complete nick or `/command` |
+| `Tab` | complete nick, `/command`, or file path (after `/upload`) |
 | `Ctrl+N` / `Ctrl+P` | next / previous buffer |
 | `Alt+1`..`9` | jump to the Nth network |
 | `Alt+↑` / `Alt+↓` | select a message (for reply/react); `Esc` deselects |
@@ -82,7 +90,15 @@ Add more `[[network]]` blocks to connect to multiple networks.
 ## Commands
 
 `/join /part /msg /query /me /nick /topic /whois /away /mode /kick /invite`
-`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /theme /react /reply /redact /quit`
+`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /theme /upload /react /reply /redact /quit`
+
+`/upload <path>` uploads a file (FILEHOST or a custom uploader) and inserts
+its URL into the composer so you can add a caption before sending. The path
+argument tab-completes against the filesystem (zsh/vim style): directories get
+a trailing `/` and a second Tab descends into them.
+
+`/joins [on|off]` toggles whether join/part/quit lines are shown (persisted to
+the sidecar `state.toml`, so your `config.toml` is untouched).
 
 `/react <emoji>` and `/reply <text>` act on the **selected** message (chosen
 with `Alt+↑/↓`), or the most recent message with a server `msgid` if none is

@@ -21,6 +21,68 @@ pub struct AppConfig {
     /// Render link preview cards (OpenGraph/title) by default. Toggle with `/unfurl`.
     #[serde(default = "default_true")]
     pub link_previews: bool,
+    /// Hide join/part/quit lines by default (cuts noise in busy channels).
+    /// Toggle live with `/joins`.
+    #[serde(default)]
+    pub hide_join_part: bool,
+    /// File-upload backend (`/upload`).
+    #[serde(default)]
+    pub upload: UploadConfig,
+}
+
+/// File-upload backend selection. When `use_custom` is false, uploads use the
+/// IRC server's advertised FILEHOST endpoint (soju.im/FILEHOST). When true,
+/// they go to the user-configured `custom` HTTP uploader (e.g. a pastebin).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UploadConfig {
+    #[serde(default)]
+    pub use_custom: bool,
+    #[serde(default)]
+    pub custom: Option<CustomUploader>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomUploader {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Multipart form field name for the file. Empty = send the raw bytes as
+    /// the request body instead of a multipart form.
+    #[serde(default = "default_upload_field")]
+    pub field: String,
+    /// How to read the resulting URL from the response: "json", "location"
+    /// (header), or "text" (whole body).
+    #[serde(default = "default_response_kind")]
+    pub response_kind: String,
+    /// JSON key holding the URL when `response_kind == "json"`.
+    #[serde(default = "default_response_key")]
+    pub response_key: String,
+}
+
+impl Default for CustomUploader {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            token: None,
+            field: default_upload_field(),
+            response_kind: default_response_kind(),
+            response_key: default_response_key(),
+        }
+    }
+}
+
+fn default_upload_field() -> String {
+    "file".into()
+}
+fn default_response_kind() -> String {
+    "json".into()
+}
+fn default_response_key() -> String {
+    "url".into()
 }
 
 /// Per-network identity + connection settings.
@@ -158,6 +220,9 @@ pub mod state {
         /// Active theme chosen live with `/theme` (overrides config.toml).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub theme: Option<String>,
+        /// Join/part/quit visibility toggled live with `/joins` (overrides config.toml).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hide_join_part: Option<bool>,
     }
 
     fn path() -> Option<PathBuf> {
@@ -183,6 +248,13 @@ pub mod state {
     pub fn save_theme(theme: &str) -> Result<(), String> {
         let mut st = load();
         st.theme = Some(theme.to_string());
+        store(&st)
+    }
+
+    /// Persist the join/part/quit visibility toggle without touching config.toml.
+    pub fn save_hide_join_part(hide: bool) -> Result<(), String> {
+        let mut st = load();
+        st.hide_join_part = Some(hide);
         store(&st)
     }
 
@@ -247,6 +319,23 @@ channels = ["#rust"]
 # ignored_nicks = ["spammer42"]
 # inline_images = true
 # link_previews = true
+# Hide join/part/quit lines (toggle live with /joins). Nick changes are
+# always shown only for people who have spoken recently.
+# hide_join_part = false
+
+# === File upload (/upload <path>) ===================================
+# By default `/upload` posts to the IRC server's advertised FILEHOST
+# endpoint (soju.im/FILEHOST), authenticating with your SASL credentials.
+# To use your own HTTP uploader (pastebin / 0x0-style service) instead:
+# [upload]
+# use_custom = true
+#   [upload.custom]
+#   name = "0x0"
+#   url = "https://0x0.st"
+#   # token = "optional-bearer-token"
+#   field = "file"          # multipart field name; "" = raw request body
+#   response_kind = "text"  # "json" | "location" (header) | "text" (body)
+#   response_key = "url"    # JSON key holding the URL when response_kind="json"
 "##;
 
 /// IRCv3 Strict Transport Security policy storage.

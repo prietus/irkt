@@ -4,6 +4,20 @@
 use super::state::*;
 use crate::irc::{MonitorCmd, Outgoing};
 
+/// Expand a leading `~` or `~/` to the user's home directory.
+pub(crate) fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) {
+            return home.join(rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf()) {
+            return home;
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
 impl App {
     pub fn run_command(&mut self, raw: &str) {
         let raw = raw.trim();
@@ -285,6 +299,29 @@ impl App {
                 let s = if self.link_previews { "on" } else { "off" };
                 self.set_status(format!("link previews {s}"));
             }
+            "upload" | "up" => {
+                if rest.is_empty() {
+                    self.set_status("usage: /upload <path> — uploads a file and drops its URL in the composer");
+                    return;
+                }
+                let path = expand_tilde(rest);
+                self.start_upload(path);
+            }
+            "joins" => {
+                // `/joins` controls visibility: on = show join/part/quit, off =
+                // hide them. (`hide_join_part` is the inverse of "show".)
+                let show = match rest {
+                    "on" | "show" => true,
+                    "off" | "hide" => false,
+                    _ => self.hide_join_part,
+                };
+                self.hide_join_part = !show;
+                if let Err(e) = crate::config::state::save_hide_join_part(self.hide_join_part) {
+                    self.set_status(format!("join/part {} (not saved: {e})", if show { "shown" } else { "hidden" }));
+                } else {
+                    self.set_status(format!("join/part/quit lines {}", if show { "shown" } else { "hidden" }));
+                }
+            }
             "react" => {
                 if rest.is_empty() {
                     self.set_status("usage: /react <emoji> — reacts to the selected/last message");
@@ -345,7 +382,7 @@ impl App {
                 self.networks[ni].status_mut().push(Line::system(
                     "commands: /join /part /msg /query /me /nick /topic /whois /away /mode \
                      /kick /invite /raw /names /monitor /setname /close /server /images \
-                     /unfurl /react /reply /redact /quit",
+                     /unfurl /joins /theme /upload /react /reply /redact /quit",
                 ));
                 self.active = ActiveBuffer { net: ni, buf: 0 };
             }

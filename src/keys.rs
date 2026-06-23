@@ -174,11 +174,26 @@ fn apply_tab(app: &mut App) {
     let before = &app.input[..app.cursor];
     let start = before.rfind(' ').map(|i| i + 1).unwrap_or(0);
     let word = &app.input[start..app.cursor];
-    if word.is_empty() && !app.input.is_empty() {
+
+    // `/upload <path>` completes filesystem paths instead of nicks.
+    let is_upload_arg = start != 0 && {
+        let cmd = app
+            .input
+            .strip_prefix('/')
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("");
+        cmd.eq_ignore_ascii_case("upload") || cmd.eq_ignore_ascii_case("up")
+    };
+
+    // An empty word is fine for path completion (lists the directory); for
+    // nicks/commands it would match everything, so bail.
+    if word.is_empty() && !app.input.is_empty() && !is_upload_arg {
         return;
     }
 
-    let (candidates, suffix) = if app.input.starts_with('/') && start == 0 {
+    let (candidates, suffix) = if is_upload_arg {
+        (complete_path(word), String::new())
+    } else if app.input.starts_with('/') && start == 0 {
         let prefix = word.strip_prefix('/').unwrap_or(word).to_lowercase();
         let cands: Vec<String> = COMMANDS
             .iter()
@@ -211,16 +226,98 @@ fn apply_tab(app: &mut App) {
     let replacement = format!("{}{}", candidates[0], suffix);
     app.input.replace_range(start..app.cursor, &replacement);
     app.cursor = start + replacement.len();
-    app.completion = Some(Completion {
-        start,
-        candidates,
-        index: 0,
-        suffix,
+    // For a unique path match, don't enter cycle mode: a second Tab should
+    // descend into the just-completed directory (or no-op on a file), like zsh.
+    if is_upload_arg && candidates.len() == 1 {
+        app.completion = None;
+    } else {
+        app.completion = Some(Completion {
+            start,
+            candidates,
+            index: 0,
+            suffix,
+        });
+    }
+}
+
+/// Filesystem path completion for `/upload`. Returns full replacements for the
+/// partial `word`, preserving any `~`/`./` prefix and appending `/` to
+/// directories. Hidden entries appear only when the prefix itself starts with `.`.
+fn complete_path(word: &str) -> Vec<String> {
+    // Split into the directory part (keeping its trailing '/') and the name
+    // prefix being completed.
+    let (dir_part, prefix) = match word.rfind('/') {
+        Some(i) => (&word[..=i], &word[i + 1..]),
+        None => ("", word),
+    };
+    let real_dir = if dir_part.is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        crate::app::commands::expand_tilde(dir_part)
+    };
+    let Ok(entries) = std::fs::read_dir(&real_dir) else {
+        return Vec::new();
+    };
+    let show_hidden = prefix.starts_with('.');
+    let prefix_lc = prefix.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        if !name.to_lowercase().starts_with(&prefix_lc) {
+            continue;
+        }
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let mut cand = format!("{dir_part}{name}");
+        if is_dir {
+            cand.push('/');
+        }
+        out.push(cand);
+    }
+    // Directories first, then case-insensitive alphabetical.
+    out.sort_by(|a, b| {
+        let ad = a.ends_with('/');
+        let bd = b.ends_with('/');
+        bd.cmp(&ad).then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
     });
+    out
 }
 
 const COMMANDS: &[&str] = &[
     "join", "part", "msg", "query", "me", "nick", "topic", "whois", "away", "mode", "kick",
     "invite", "raw", "names", "monitor", "buddy", "setname", "close", "server", "images",
-    "unfurl", "theme", "react", "reply", "redact", "quit", "help",
+    "unfurl", "joins", "theme", "upload", "react", "reply", "redact", "quit", "help",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::complete_path;
+
+    // `cargo test` runs with the crate root (where Cargo.toml lives) as cwd, so
+    // we can complete against the repo's own files.
+    #[test]
+    fn completes_files_in_cwd() {
+        assert!(complete_path("Carg").iter().any(|c| c == "Cargo.toml"));
+    }
+
+    #[test]
+    fn directories_get_a_slash_and_sort_first() {
+        let cands = complete_path("sr");
+        assert!(cands.iter().any(|c| c == "src/"), "src should complete with a trailing slash");
+        assert!(cands[0].ends_with('/'), "directories sort before files");
+    }
+
+    #[test]
+    fn descends_into_a_directory() {
+        assert!(complete_path("src/key").iter().any(|c| c == "src/keys.rs"));
+    }
+
+    #[test]
+    fn hides_dotfiles_unless_prefix_asks() {
+        assert!(!complete_path("").iter().any(|c| c.starts_with(".git")));
+        // The repo has a .github/ dir; an explicit dot prefix reveals it.
+        assert!(complete_path(".gith").iter().any(|c| c.starts_with(".github")));
+    }
+}

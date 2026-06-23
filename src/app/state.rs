@@ -181,6 +181,16 @@ impl Buffer {
         }
     }
 
+    /// True if `nick` authored a message or action within the last `window`
+    /// lines of this buffer. Used to decide whether a nick-change is worth
+    /// surfacing here (people who never talk generate pure noise).
+    pub fn spoke_recently(&self, nick: &str, window: usize) -> bool {
+        self.lines.iter().rev().take(window).any(|l| {
+            matches!(l.kind, LineKind::Message | LineKind::Action | LineKind::Self_)
+                && l.from.eq_ignore_ascii_case(nick)
+        })
+    }
+
     pub fn push(&mut self, line: Line) {
         // Keep the view pinned to the bottom unless the user scrolled up.
         self.lines.push(line);
@@ -276,6 +286,15 @@ pub struct App {
     pub show_sidebar: bool,
     pub inline_images: bool,
     pub link_previews: bool,
+    /// Hide join/part/quit lines in channel buffers (toggle with `/joins`).
+    pub hide_join_part: bool,
+    /// File-upload backend config (`/upload`).
+    pub upload_cfg: crate::config::UploadConfig,
+    /// True while an upload is in flight (prevents overlapping uploads).
+    pub uploading: bool,
+    /// Channel an upload task reports its result back on. Set by `main` after
+    /// construction; `None` in tests (uploads become no-ops).
+    pub up_tx: Option<tokio::sync::mpsc::Sender<crate::upload::UploadMsg>>,
     /// When true, the composer's next submission is an emoji reaction to the
     /// selected (or last) message rather than a normal message.
     pub react_mode: bool,
@@ -300,6 +319,8 @@ impl App {
     pub fn new(config: AppConfig, images: Images) -> Self {
         let inline_images = config.inline_images;
         let link_previews = config.link_previews;
+        let hide_join_part = config.hide_join_part;
+        let upload_cfg = config.upload.clone();
         let theme = Theme::by_name(config.theme.as_deref().unwrap_or("dark"));
         App {
             config,
@@ -312,6 +333,10 @@ impl App {
             show_sidebar: true,
             inline_images,
             link_previews,
+            hide_join_part,
+            upload_cfg,
+            uploading: false,
+            up_tx: None,
             react_mode: false,
             status_msg: None,
             completion: None,

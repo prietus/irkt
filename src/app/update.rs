@@ -4,6 +4,10 @@
 use super::state::*;
 use crate::irc::{Event, MsgMeta, Outgoing, TypingState};
 
+/// How many recent lines back we look to decide whether a nick has "spoken
+/// recently" before surfacing their nick-change in a channel.
+const NICK_ACTIVITY_WINDOW: usize = 200;
+
 impl App {
     /// True if `body` mentions us or a highlight keyword (case-insensitive,
     /// rough word-boundary match).
@@ -177,7 +181,8 @@ impl App {
             }
             Event::NickChanged { old, new, .. } => {
                 let net = &mut self.networks[ni];
-                if old.eq_ignore_ascii_case(&net.nick) {
+                let is_self = old.eq_ignore_ascii_case(&net.nick);
+                if is_self {
                     net.nick = new.clone();
                 }
                 for m in net.members.values_mut() {
@@ -189,6 +194,17 @@ impl App {
                 }
                 let text = format!("{old} is now known as {new}");
                 for bi in 0..net.buffers.len() {
+                    // Only surface a rename where it's actually meaningful: our
+                    // own nick change, the query buffer with that person, or a
+                    // channel where they've spoken recently. In a 1000-person
+                    // channel this hides the constant churn from lurkers.
+                    let relevant = is_self
+                        || net.buffers[bi].name.eq_ignore_ascii_case(&old)
+                        || net.buffers[bi].name.eq_ignore_ascii_case(&new)
+                        || net.buffers[bi].spoke_recently(&old, NICK_ACTIVITY_WINDOW);
+                    if !relevant {
+                        continue;
+                    }
                     net.buffers[bi].push(Line {
                         time: String::new(),
                         kind: LineKind::System,
@@ -727,6 +743,57 @@ mod tests {
         // and clear the selection.
         assert_eq!(app.networks[0].pending_replies.last().map(|(_, _, p)| p.as_str()), Some("p1"));
         assert_eq!(app.networks[0].buffers[bi].selection, None);
+    }
+
+    #[test]
+    fn nick_change_only_shown_where_nick_spoke_recently() {
+        let mut app = test_app();
+        // Two channels; the renamer spoke only in #spoke.
+        let spoke = app.networks[0].ensure_buffer("#spoke", BufferKind::Channel);
+        let quiet = app.networks[0].ensure_buffer("#quiet", BufferKind::Channel);
+        for ch in [spoke, quiet] {
+            let name = app.networks[0].buffers[ch].name.to_lowercase();
+            app.networks[0].members.insert(
+                name,
+                vec![crate::irc::MemberEntry { nick: "alice".into(), prefixes: String::new(), userhost: None }],
+            );
+        }
+        app.apply_event(0, Event::Privmsg {
+            target: "#spoke".into(),
+            nick: "alice".into(),
+            body: "hi".into(),
+            meta: meta(),
+        });
+
+        let before_spoke = app.networks[0].buffers[spoke].lines.len();
+        let before_quiet = app.networks[0].buffers[quiet].lines.len();
+        app.apply_event(0, Event::NickChanged {
+            old: "alice".into(),
+            new: "alice_".into(),
+            meta: meta(),
+        });
+
+        // The rename appears where she spoke, but not in the channel she lurked.
+        assert_eq!(app.networks[0].buffers[spoke].lines.len(), before_spoke + 1);
+        assert_eq!(app.networks[0].buffers[quiet].lines.len(), before_quiet);
+        assert!(app.networks[0].buffers[spoke].lines.last().unwrap().text.contains("now known as"));
+        // The member list is renamed in both, regardless of visibility.
+        assert!(app.networks[0].members["#quiet"].iter().any(|m| m.nick == "alice_"));
+    }
+
+    #[test]
+    fn own_nick_change_shown_everywhere() {
+        let mut app = test_app();
+        let quiet = app.networks[0].ensure_buffer("#quiet", BufferKind::Channel);
+        let before = app.networks[0].buffers[quiet].lines.len();
+        // We never "spoke" in #quiet, but our own rename should still appear.
+        app.apply_event(0, Event::NickChanged {
+            old: "me".into(),
+            new: "me2".into(),
+            meta: meta(),
+        });
+        assert_eq!(app.networks[0].nick, "me2");
+        assert_eq!(app.networks[0].buffers[quiet].lines.len(), before + 1);
     }
 
     #[test]

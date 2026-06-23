@@ -171,6 +171,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
 
     let inline = app.inline_images;
     let unfurl = app.link_previews;
+    let hide_join_part = app.hide_join_part;
     let img_cols = (body.width).min(IMAGE_MAX_COLS).max(1);
 
     // First, ensure a fetch is in flight for any URL in this buffer. Whether
@@ -248,6 +249,12 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         };
         for i in 0..lines.len() {
             if is_child[i] {
+                continue;
+            }
+            // Hide join/part/quit churn when /joins is off.
+            if hide_join_part
+                && matches!(lines[i].kind, LineKind::Join | LineKind::Part | LineKind::Quit)
+            {
                 continue;
             }
             push_message(&ctx, i, 0, &mut rows, &mut placements, &mut sel_range);
@@ -689,15 +696,24 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     } else {
         (format!("[{target}] "), t.accent)
     };
+    // A persistent upload indicator (survives keystrokes, unlike status_msg).
+    let badge = if app.uploading {
+        Some(Span::styled("⋯up ", Style::default().fg(t.warn).add_modifier(Modifier::BOLD)))
+    } else {
+        None
+    };
+    let badge_w = badge.as_ref().map(|s| s.width()).unwrap_or(0);
     let prompt_w = prompt.width();
-    let line = RLine::from(vec![
-        Span::styled(prompt, Style::default().fg(color)),
-        Span::raw(app.input.clone()),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
-    // Cursor position: prompt width + display width of input up to cursor.
+    let mut spans = Vec::new();
+    if let Some(b) = badge {
+        spans.push(b);
+    }
+    spans.push(Span::styled(prompt, Style::default().fg(color)));
+    spans.push(Span::raw(app.input.clone()));
+    f.render_widget(Paragraph::new(RLine::from(spans)), area);
+    // Cursor position: badge + prompt width + display width of input up to cursor.
     let before = &app.input[..app.cursor.min(app.input.len())];
-    let cx = area.x + (prompt_w + before.width()) as u16;
+    let cx = area.x + (badge_w + prompt_w + before.width()) as u16;
     f.set_cursor_position((cx.min(area.x + area.width.saturating_sub(1)), area.y));
 }
 
@@ -721,8 +737,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     if spans.is_empty() {
         let net = app.active_net().map(|n| n.cfg.name.as_str()).unwrap_or("-");
         let nick = app.active_net().map(|n| n.nick.as_str()).unwrap_or("-");
+        let attach = if app.has_upload_target() { " · 📎 /upload" } else { "" };
         spans.push(Span::styled(
-            format!(" irkt · {net} · {nick}  —  ^N/^P switch · ⌥↑↓ select · ⌥R react · Tab complete · ^C quit"),
+            format!(" irkt · {net} · {nick}  —  ^N/^P switch · ⌥↑↓ select · ⌥R react{attach} · Tab complete · ^C quit"),
             Style::default().fg(t.dim),
         ));
     }

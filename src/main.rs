@@ -5,6 +5,7 @@ mod irc;
 mod keys;
 mod theme;
 mod ui;
+mod upload;
 
 use std::io::{self, Stdout};
 use std::sync::OnceLock;
@@ -73,6 +74,7 @@ enum Tick {
     Resize,
     Irc(usize, IrcEvent),
     Image(ImageMsg),
+    Upload(upload::UploadMsg),
 }
 
 async fn run(cfg: config::AppConfig) -> io::Result<()> {
@@ -83,6 +85,8 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
     let (img_tx, mut img_rx) = mpsc::channel::<ImageMsg>(64);
     let images = Images::new(picker, img_tx);
+    // Channel uploads report their result back on, bridged into the Tick loop.
+    let (up_tx, mut up_rx) = mpsc::channel::<upload::UploadMsg>(16);
 
     // Buddy lists modified live via /monitor are stored in a sidecar so the
     // user's config.toml is never rewritten. Merge them back in here.
@@ -93,6 +97,11 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
     if let Some(name) = &saved.theme {
         app.theme = theme::Theme::by_name(name);
     }
+    // Likewise the /joins visibility toggle (sidecar) overrides config.toml.
+    if let Some(hide) = saved.hide_join_part {
+        app.hide_join_part = hide;
+    }
+    app.up_tx = Some(up_tx);
     for (id, net_cfg) in cfg.networks.iter().enumerate() {
         if !net_cfg.autoconnect {
             continue;
@@ -136,6 +145,18 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         });
     }
 
+    // Forward upload results into the unified channel.
+    {
+        let tx = tick_tx.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = up_rx.recv().await {
+                if tx.send(Tick::Upload(msg)).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     // Dedicated terminal-input reader. Owning the EventStream in its own task
     // means its reads are never cancelled by other branches.
     {
@@ -172,6 +193,7 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
             Tick::Resize => {}
             Tick::Irc(id, ev) => app.apply_event(id, ev),
             Tick::Image(msg) => app.images.apply(msg),
+            Tick::Upload(msg) => app.on_upload_finished(msg),
         }
         if app.should_quit {
             break;

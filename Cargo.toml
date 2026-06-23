@@ -23,11 +23,13 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # Inline images
 ratatui-image = "4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "multipart"] }
 
 # Utilities
 indexmap = "2"
 unicode-width = "0.2"
+mime_guess = "2"
+serde_json = "1"
 
 [profile.release]
 lto = true
