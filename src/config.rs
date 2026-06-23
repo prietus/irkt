@@ -223,6 +223,10 @@ pub mod state {
         /// Join/part/quit visibility toggled live with `/joins` (overrides config.toml).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub hide_join_part: Option<bool>,
+        /// Per-buffer language for spell-check/autocomplete, set with `/lang`.
+        /// Keyed by `"<network>/<channel-lowercased>"`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub channel_langs: BTreeMap<String, String>,
     }
 
     fn path() -> Option<PathBuf> {
@@ -255,6 +259,21 @@ pub mod state {
     pub fn save_hide_join_part(hide: bool) -> Result<(), String> {
         let mut st = load();
         st.hide_join_part = Some(hide);
+        store(&st)
+    }
+
+    /// Set or clear a buffer's `/lang` choice without touching config.toml.
+    /// `lang = None` removes the entry (spell-check/autocomplete off there).
+    pub fn save_channel_lang(key: &str, lang: Option<&str>) -> Result<(), String> {
+        let mut st = load();
+        match lang {
+            Some(l) => {
+                st.channel_langs.insert(key.to_string(), l.to_string());
+            }
+            None => {
+                st.channel_langs.remove(key);
+            }
+        }
         store(&st)
     }
 
@@ -322,6 +341,13 @@ channels = ["#rust"]
 # Hide join/part/quit lines (toggle live with /joins). Nick changes are
 # always shown only for people who have spoken recently.
 # hide_join_part = false
+
+# === Spell-check & autocomplete =====================================
+# Per-channel, enabled live with /lang <code> (e.g. /lang en, /lang es;
+# /lang off to disable). Put hunspell .dic/.aff pairs in a "dicts" folder
+# next to this file (e.g. en_US.dic + en_US.aff -> the "en" language); the
+# .dic alone gives autocomplete, the .aff adds spell checking. On Linux,
+# /usr/share/hunspell and /usr/share/myspell/dicts are also used.
 
 # === File upload (/upload <path>) ===================================
 # By default `/upload` posts to the IRC server's advertised FILEHOST

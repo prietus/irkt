@@ -42,6 +42,13 @@ the [`irc`](https://crates.io/crates/irc) protocol crate, and `tokio`.
 - **Quiet busy channels** — hide join/part/quit churn with `/joins` (or
   `hide_join_part` in config), and "*nick* is now known as …" lines only show
   for people who have actually spoken recently, not silent lurkers.
+- **Autocomplete & spell-check** — as you type, a dim **ghost suggestion**
+  completes the current `/command`, channel nick, or — for channels with a
+  language set — a dictionary word; `Tab` accepts it. With a language set,
+  misspelled words are **underlined** live and `Alt+S` replaces the nearest one
+  with its top correction (alternatives shown in the status bar). Enable per
+  channel with `/lang <code>`; dictionaries are standard hunspell `.dic`/`.aff`
+  files (see [Spell-check](#spell-check--autocomplete-dictionaries)).
 - **TUI** — network/channel sidebar with unread + mention badges and buddy
   presence, member list with prefixes, topic bar, typing indicator,
   tab-completion (nicks + commands), and scrollback.
@@ -81,6 +88,7 @@ Add more `[[network]]` blocks to connect to multiple networks.
 | `Alt+↑` / `Alt+↓` | select a message (for reply/react); `Esc` deselects |
 | `Enter` (with a message selected) | send your text as a threaded reply to it |
 | `Alt+R` | react to the selected (or last) message — type/insert an emoji with your OS picker, then `Enter` |
+| `Alt+S` | correct the nearest misspelled word (needs `/lang`) |
 | `PageUp` / `PageDown` | scroll the buffer |
 | `Alt+B` / `Alt+M` | toggle sidebar / member list |
 | `Ctrl+A` / `Ctrl+E` | start / end of line |
@@ -90,7 +98,7 @@ Add more `[[network]]` blocks to connect to multiple networks.
 ## Commands
 
 `/join /part /msg /query /me /nick /topic /whois /away /mode /kick /invite`
-`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /theme /upload /react /reply /redact /quit`
+`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /theme /lang /upload /react /reply /redact /quit`
 
 `/upload <path>` uploads a file (FILEHOST or a custom uploader) and inserts
 its URL into the composer so you can add a caption before sending. The path
@@ -99,6 +107,28 @@ a trailing `/` and a second Tab descends into them.
 
 `/joins [on|off]` toggles whether join/part/quit lines are shown (persisted to
 the sidecar `state.toml`, so your `config.toml` is untouched).
+
+`/lang <code>` sets the spell-check / autocomplete language for the current
+channel or query (e.g. `/lang en`, `/lang es`); `/lang off` disables it and
+`/lang` alone reports the current setting and the dictionaries available. The
+choice is per-buffer and persisted to `state.toml`.
+
+### Spell-check & autocomplete dictionaries
+
+irkt reads standard **hunspell** dictionaries — a `.dic` word list (used for
+ghost-text autocomplete) and its matching `.aff` affix file (used for spell
+checking and corrections). Drop the pairs into a `dicts/` folder next to your
+config:
+
+- Linux: `~/.config/irkt/dicts/`
+- macOS: `~/Library/Application Support/irkt/dicts/`
+
+On Linux, the system dictionaries in `/usr/share/hunspell` and
+`/usr/share/myspell/dicts` are also picked up automatically. The language code
+is the first two letters of the filename, so `en_US.dic`/`en_US.aff` register as
+`en`, `es_ES.*` as `es`, and so on. Without a dictionary for a language, `/lang`
+will tell you what's installed; with only a `.dic` (no `.aff`) you still get
+autocomplete but not spell checking.
 
 `/react <emoji>` and `/reply <text>` act on the **selected** message (chosen
 with `Alt+↑/↓`), or the most recent message with a server `msgid` if none is

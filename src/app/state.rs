@@ -309,6 +309,15 @@ pub struct App {
     pub images: Images,
     /// Active color theme.
     pub theme: Theme,
+    /// Dictionary words for ghost-text completion, keyed by lang code ("en").
+    /// Loaded once at startup; empty when no `.dic` files are found.
+    pub dict_words: crate::dict::Words,
+    /// Hunspell spell checkers keyed by lang code. Only langs with a matching
+    /// `.aff`+`.dic` pair get one.
+    pub spellers: crate::spell::Spellers,
+    /// Per-buffer language for spell-check/autocomplete, set with `/lang`.
+    /// Keyed by `"<network>/<channel-lowercased>"` (see `App::lang_key`).
+    pub channel_langs: std::collections::HashMap<String, String>,
 }
 
 pub struct Completion {
@@ -346,6 +355,9 @@ impl App {
             completion: None,
             images,
             theme,
+            dict_words: std::collections::HashMap::new(),
+            spellers: std::collections::HashMap::new(),
+            channel_langs: std::collections::HashMap::new(),
         }
     }
 

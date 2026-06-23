@@ -720,7 +720,27 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         spans.push(b);
     }
     spans.push(Span::styled(prompt, Style::default().fg(color)));
-    spans.push(Span::raw(app.input.clone()));
+    // The input itself, with misspelled words underlined in the "bad" color.
+    let misspelled = app.misspelled_ranges();
+    let mut at = 0usize;
+    for &(s, e) in &misspelled {
+        if s > at {
+            spans.push(Span::raw(app.input[at..s].to_string()));
+        }
+        spans.push(Span::styled(
+            app.input[s..e].to_string(),
+            Style::default().fg(t.bad).add_modifier(Modifier::UNDERLINED),
+        ));
+        at = e;
+    }
+    if at < app.input.len() {
+        spans.push(Span::raw(app.input[at..].to_string()));
+    }
+    // Dim ghost-text completion shown after the cursor (cursor is at the end
+    // whenever a ghost exists, so it trails the input).
+    if let Some(ghost) = app.ghost_suggestion() {
+        spans.push(Span::styled(ghost, Style::default().fg(t.dim)));
+    }
     f.render_widget(Paragraph::new(RLine::from(spans)), area);
     // Cursor position: badge + prompt width + display width of input up to cursor.
     let before = &app.input[..app.cursor.min(app.input.len())];
@@ -749,8 +769,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         let net = app.active_net().map(|n| n.cfg.name.as_str()).unwrap_or("-");
         let nick = app.active_net().map(|n| n.nick.as_str()).unwrap_or("-");
         let attach = if app.has_upload_target() { " · 📎 /upload" } else { "" };
+        let spell = if app.active_lang().is_some() { " · ⌥S fix" } else { "" };
         spans.push(Span::styled(
-            format!(" irkt · {net} · {nick}  —  ^N/^P switch · ⌥↑↓ select · ⌥R react{attach} · Tab complete · ^C quit"),
+            format!(" irkt · {net} · {nick}  —  ^N/^P switch · ⌥↑↓ select · ⌥R react{attach}{spell} · Tab complete · ^C quit"),
             Style::default().fg(t.dim),
         ));
     }

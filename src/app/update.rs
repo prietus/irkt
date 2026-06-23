@@ -232,6 +232,10 @@ impl App {
             }
             Event::TypingChanged { target, nick, state } => {
                 let net = &mut self.networks[ni];
+                // Ignore our own typing echoed back (echo-message networks).
+                if nick.eq_ignore_ascii_case(&net.nick) {
+                    return;
+                }
                 let bname = if net.is_channel(&target) { target } else { nick.clone() };
                 if let Some(bi) = net.find_buffer(&bname) {
                     let typing = &mut net.buffers[bi].typing;
@@ -911,6 +915,27 @@ mod tests {
         app.active = ActiveBuffer { net: 0, buf: 0 };
         app.notify_typing();
         assert!(out_rx.try_recv().is_err(), "never announce typing in the status buffer");
+    }
+
+    #[test]
+    fn own_typing_echo_is_ignored() {
+        let (mut app, _out) = app_with_outbox();
+        app.networks[0].nick = "me".into();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        // A peer typing shows up.
+        app.apply_event(0, Event::TypingChanged {
+            target: "#c".into(),
+            nick: "alice".into(),
+            state: TypingState::Active,
+        });
+        assert_eq!(app.networks[0].buffers[bi].typing, vec!["alice".to_string()]);
+        // Our own typing, echoed back by the server, does not.
+        app.apply_event(0, Event::TypingChanged {
+            target: "#c".into(),
+            nick: "me".into(),
+            state: TypingState::Active,
+        });
+        assert_eq!(app.networks[0].buffers[bi].typing, vec!["alice".to_string()]);
     }
 
     #[test]

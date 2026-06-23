@@ -1,8 +1,10 @@
 mod app;
 mod config;
+mod dict;
 mod images;
 mod irc;
 mod keys;
+mod spell;
 mod theme;
 mod ui;
 mod upload;
@@ -102,6 +104,12 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         app.hide_join_part = hide;
     }
     app.up_tx = Some(up_tx);
+    // Per-channel languages chosen with /lang (sidecar) drive spell-check and
+    // dictionary autocomplete. The dictionaries themselves are loaded lazily
+    // off disk (hunspell .dic/.aff); both maps are empty when none are present.
+    app.channel_langs = saved.channel_langs.clone().into_iter().collect();
+    app.dict_words = dict::load_all();
+    app.spellers = spell::load_all();
     for (id, net_cfg) in cfg.networks.iter().enumerate() {
         if !net_cfg.autoconnect {
             continue;

@@ -290,6 +290,7 @@ impl App {
                     self.set_status(format!("theme: {}", self.theme.name));
                 }
             }
+            "lang" | "spell" => self.cmd_lang(rest),
             "unfurl" => {
                 self.link_previews = match rest {
                     "on" => true,
@@ -382,13 +383,56 @@ impl App {
                 self.networks[ni].status_mut().push(Line::system(
                     "commands: /join /part /msg /query /me /nick /topic /whois /away /mode \
                      /kick /invite /raw /names /monitor /setname /close /server /images \
-                     /unfurl /joins /theme /upload /react /reply /redact /quit",
+                     /unfurl /joins /theme /lang /upload /react /reply /redact /quit",
                 ));
                 self.active = ActiveBuffer { net: ni, buf: 0 };
             }
             other => {
                 self.set_status(format!("unknown command: /{other}"));
             }
+        }
+    }
+
+    /// `/lang [code|off]` — set the spell-check / autocomplete language for the
+    /// active channel or query. With no argument, reports the current setting
+    /// and the dictionaries available.
+    fn cmd_lang(&mut self, rest: &str) {
+        let Some(key) = self.lang_key() else {
+            self.set_status("no channel/query here to set a language for");
+            return;
+        };
+        // Languages we actually have data for (autocomplete and/or checker).
+        let mut available: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        available.extend(self.dict_words.keys().map(String::as_str));
+        available.extend(self.spellers.keys().map(String::as_str));
+        let avail = if available.is_empty() {
+            "none installed — drop hunspell .dic/.aff files in the config dir's dicts/".to_string()
+        } else {
+            available.into_iter().collect::<Vec<_>>().join(", ")
+        };
+
+        let arg = rest.split_whitespace().next().unwrap_or("");
+        if arg.is_empty() {
+            let cur = self.active_lang().unwrap_or("none");
+            self.set_status(format!("lang: {cur} (available: {avail})"));
+            return;
+        }
+        if matches!(arg, "off" | "none" | "clear") {
+            self.channel_langs.remove(&key);
+            let _ = crate::config::state::save_channel_lang(&key, None);
+            self.set_status("spell-check/autocomplete off for this buffer");
+            return;
+        }
+        let lang = arg.to_lowercase();
+        if !self.dict_words.contains_key(&lang) && !self.spellers.contains_key(&lang) {
+            self.set_status(format!("no dictionary for '{lang}' (available: {avail})"));
+            return;
+        }
+        self.channel_langs.insert(key.clone(), lang.clone());
+        if let Err(e) = crate::config::state::save_channel_lang(&key, Some(&lang)) {
+            self.set_status(format!("lang: {lang} (not saved: {e})"));
+        } else {
+            self.set_status(format!("lang: {lang}"));
         }
     }
 

@@ -34,6 +34,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('e') if ctrl => app.cursor = app.input.len(),
         KeyCode::Char('b') if alt => app.show_sidebar = !app.show_sidebar,
         KeyCode::Char('m') if alt => app.show_members = !app.show_members,
+        KeyCode::Char('s') if alt => app.spell_fix(),
         KeyCode::Char('r') if alt => {
             // Enter react mode: the next submitted line is an emoji reaction to
             // the selected (or last) message. Insert the emoji with your OS
@@ -237,6 +238,18 @@ fn apply_tab(app: &mut App) {
     };
 
     if candidates.is_empty() {
+        // No command / nick / path match — fall back to the inline ghost
+        // suggestion (dictionary word for the channel's language). Accept it
+        // by appending the rest; no cycling.
+        if !is_upload_arg {
+            if let Some(rest) = app.ghost_suggestion() {
+                if !rest.is_empty() {
+                    app.input.insert_str(app.cursor, &rest);
+                    app.cursor += rest.len();
+                    app.completion = None;
+                }
+            }
+        }
         return;
     }
     let replacement = format!("{}{}", candidates[0], suffix);
@@ -301,10 +314,10 @@ fn complete_path(word: &str) -> Vec<String> {
     out
 }
 
-const COMMANDS: &[&str] = &[
+pub(crate) const COMMANDS: &[&str] = &[
     "join", "part", "msg", "query", "me", "nick", "topic", "whois", "away", "mode", "kick",
     "invite", "raw", "names", "monitor", "buddy", "setname", "close", "server", "images",
-    "unfurl", "joins", "theme", "upload", "react", "reply", "redact", "quit", "help",
+    "unfurl", "joins", "theme", "lang", "upload", "react", "reply", "redact", "quit", "help",
 ];
 
 #[cfg(test)]
