@@ -42,6 +42,9 @@ the [`irc`](https://crates.io/crates/irc) protocol crate, and `tokio`.
 - **Quiet busy channels** — hide join/part/quit churn with `/joins` (or
   `hide_join_part` in config), and "*nick* is now known as …" lines only show
   for people who have actually spoken recently, not silent lurkers.
+- **Mention highlights** — lines that mention your nick, or any keyword you set
+  (`/highlight add irkt murmur`, or `highlight_keywords` in config), are tinted
+  and bump the buffer's mention badge. Word-boundary, case-insensitive.
 - **Autocomplete & spell-check** — as you type, a dim **ghost suggestion**
   completes the current `/command`, channel nick, or — for channels with a
   language set — a dictionary word; `Tab` accepts it. With a language set,
@@ -98,7 +101,13 @@ Add more `[[network]]` blocks to connect to multiple networks.
 ## Commands
 
 `/join /part /msg /query /me /nick /topic /whois /away /mode /kick /invite`
-`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /theme /lang /upload /react /reply /redact /quit`
+`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /theme /lang /highlight /upload /react /reply /redact /quit`
+
+`/highlight [add|del|clear] <word>…` manages the words (besides your nick) that
+tint a line and bump its mention badge — e.g. `/highlight add irkt murmur`.
+With no argument it lists them; changes persist to `state.toml` and merge with
+any `highlight_keywords` in `config.toml`. Matching is case-insensitive and
+word-boundary (so `irkt` won't fire inside `quirkt`).
 
 `/upload <path>` uploads a file (FILEHOST or a custom uploader) and inserts
 its URL into the composer so you can add a caption before sending. The path

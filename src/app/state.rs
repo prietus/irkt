@@ -318,6 +318,9 @@ pub struct App {
     /// Per-buffer language for spell-check/autocomplete, set with `/lang`.
     /// Keyed by `"<network>/<channel-lowercased>"` (see `App::lang_key`).
     pub channel_langs: std::collections::HashMap<String, String>,
+    /// Words (besides your nick) that trigger a mention highlight. Seeded from
+    /// `config.highlight_keywords`, edited live with `/highlight`.
+    pub highlight_keywords: Vec<String>,
 }
 
 pub struct Completion {
@@ -333,6 +336,7 @@ impl App {
         let link_previews = config.link_previews;
         let hide_join_part = config.hide_join_part;
         let upload_cfg = config.upload.clone();
+        let highlight_keywords = config.highlight_keywords.clone();
         let theme = Theme::by_name(config.theme.as_deref().unwrap_or("dark"));
         App {
             config,
@@ -358,6 +362,7 @@ impl App {
             dict_words: std::collections::HashMap::new(),
             spellers: std::collections::HashMap::new(),
             channel_langs: std::collections::HashMap::new(),
+            highlight_keywords,
         }
     }
 

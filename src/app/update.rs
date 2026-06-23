@@ -15,7 +15,7 @@ impl App {
         let lower = body.to_lowercase();
         let nick = self.networks[net_idx].nick.to_lowercase();
         let mut keys: Vec<&str> = vec![nick.as_str()];
-        for k in &self.config.highlight_keywords {
+        for k in &self.highlight_keywords {
             keys.push(k.as_str());
         }
         keys.iter().any(|k| {
@@ -643,6 +643,29 @@ mod tests {
         });
         let bi = app.networks[0].find_buffer("#rust").unwrap();
         assert!(app.networks[0].buffers[bi].lines.last().unwrap().highlight);
+    }
+
+    #[test]
+    fn highlight_keyword_triggers_mention() {
+        let mut app = test_app();
+        app.highlight_keywords = vec!["irkt".into()];
+        app.apply_event(0, Event::Privmsg {
+            target: "#rust".into(),
+            nick: "alice".into(),
+            body: "have you tried IRKT yet?".into(), // case-insensitive, word-boundary
+            meta: meta(),
+        });
+        let bi = app.networks[0].find_buffer("#rust").unwrap();
+        assert!(app.networks[0].buffers[bi].lines.last().unwrap().highlight);
+
+        // A keyword embedded inside another word must NOT trigger.
+        app.apply_event(0, Event::Privmsg {
+            target: "#rust".into(),
+            nick: "alice".into(),
+            body: "quirktastic".into(),
+            meta: meta(),
+        });
+        assert!(!app.networks[0].buffers[bi].lines.last().unwrap().highlight);
     }
 
     #[test]

@@ -290,6 +290,7 @@ impl App {
                     self.set_status(format!("theme: {}", self.theme.name));
                 }
             }
+            "highlight" | "hl" => self.cmd_highlight(rest),
             "lang" | "spell" => self.cmd_lang(rest),
             "unfurl" => {
                 self.link_previews = match rest {
@@ -383,13 +384,81 @@ impl App {
                 self.networks[ni].status_mut().push(Line::system(
                     "commands: /join /part /msg /query /me /nick /topic /whois /away /mode \
                      /kick /invite /raw /names /monitor /setname /close /server /images \
-                     /unfurl /joins /theme /lang /upload /react /reply /redact /quit",
+                     /unfurl /joins /theme /lang /highlight /upload /react /reply /redact /quit",
                 ));
                 self.active = ActiveBuffer { net: ni, buf: 0 };
             }
             other => {
                 self.set_status(format!("unknown command: /{other}"));
             }
+        }
+    }
+
+    /// `/highlight [add|del|clear] <word>...` — manage the words (besides your
+    /// nick) that trigger a mention highlight. No argument lists them. Changes
+    /// persist to the sidecar `state.toml`, so `config.toml` is untouched.
+    fn cmd_highlight(&mut self, rest: &str) {
+        let (sub, args) = match rest.split_once(char::is_whitespace) {
+            Some((s, a)) => (s.to_lowercase(), a.trim()),
+            None => (rest.to_lowercase(), ""),
+        };
+        match sub.as_str() {
+            "" | "list" => {
+                if self.highlight_keywords.is_empty() {
+                    self.set_status("no highlight words (add with /highlight add <word>)");
+                } else {
+                    self.set_status(format!("highlight words: {}", self.highlight_keywords.join(", ")));
+                }
+            }
+            "add" | "+" => {
+                let words: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+                if words.is_empty() {
+                    self.set_status("usage: /highlight add <word>...");
+                    return;
+                }
+                for w in words {
+                    if !self.highlight_keywords.iter().any(|k| k.eq_ignore_ascii_case(&w)) {
+                        self.highlight_keywords.push(w);
+                    }
+                }
+                self.persist_highlights();
+            }
+            "del" | "-" | "rm" | "remove" => {
+                let words: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+                if words.is_empty() {
+                    self.set_status("usage: /highlight del <word>...");
+                    return;
+                }
+                self.highlight_keywords
+                    .retain(|k| !words.iter().any(|w| w.eq_ignore_ascii_case(k)));
+                self.persist_highlights();
+            }
+            "clear" => {
+                self.highlight_keywords.clear();
+                self.persist_highlights();
+            }
+            // Bare `/highlight foo bar` is a convenient shorthand for `add`.
+            _ => {
+                let words: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+                for w in words {
+                    if !self.highlight_keywords.iter().any(|k| k.eq_ignore_ascii_case(&w)) {
+                        self.highlight_keywords.push(w);
+                    }
+                }
+                self.persist_highlights();
+            }
+        }
+    }
+
+    fn persist_highlights(&mut self) {
+        let summary = if self.highlight_keywords.is_empty() {
+            "highlight words cleared".to_string()
+        } else {
+            format!("highlight words: {}", self.highlight_keywords.join(", "))
+        };
+        match crate::config::state::save_highlight_keywords(&self.highlight_keywords) {
+            Ok(()) => self.set_status(summary),
+            Err(e) => self.set_status(format!("{summary} (not saved: {e})")),
         }
     }
 

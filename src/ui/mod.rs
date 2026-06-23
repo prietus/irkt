@@ -296,7 +296,10 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         let vis_bot = rend.min(end);
         let y = body.y + (vis_top - start) as u16;
         let height = (vis_bot - vis_top) as u16;
-        let rect = Rect { x: body.x, y, width: cols.min(body.width), height };
+        // Center the image horizontally within the message area.
+        let w = cols.min(body.width);
+        let x = body.x + (body.width.saturating_sub(w)) / 2;
+        let rect = Rect { x, y, width: w, height };
         if let Some(ImageState::Ready { proto, .. }) = app.images.map.get_mut(&url) {
             f.render_stateful_widget(
                 StatefulImage::default().resize(Resize::Fit(None)),

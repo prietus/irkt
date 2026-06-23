@@ -110,6 +110,12 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
     app.channel_langs = saved.channel_langs.clone().into_iter().collect();
     app.dict_words = dict::load_all();
     app.spellers = spell::load_all();
+    // Merge live-added highlight keywords (sidecar) with any from config.toml.
+    for w in &saved.highlight_keywords {
+        if !app.highlight_keywords.iter().any(|k| k.eq_ignore_ascii_case(w)) {
+            app.highlight_keywords.push(w.clone());
+        }
+    }
     for (id, net_cfg) in cfg.networks.iter().enumerate() {
         if !net_cfg.autoconnect {
             continue;
@@ -190,8 +196,10 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
 
     let mut term = setup_terminal()?;
     term.draw(|f| ui::draw(f, &mut app))?;
+    let mut view = view_key(&app);
 
     while let Some(tick) = tick_rx.recv().await {
+        let resized = matches!(tick, Tick::Resize);
         match tick {
             Tick::Key(key) => {
                 if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -206,11 +214,27 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         if app.should_quit {
             break;
         }
+        // Inline images drawn with a terminal graphics protocol aren't erased by
+        // ratatui's cell diffing, so a scroll / buffer switch / panel toggle /
+        // resize would leave stale image pixels behind. Force a full clear on
+        // those view changes (only when graphics are actually on screen).
+        let new_view = view_key(&app);
+        if (new_view != view || resized) && app.images.graphics_active() {
+            term.clear()?;
+        }
+        view = new_view;
         term.draw(|f| ui::draw(f, &mut app))?;
     }
 
     restore_terminal(&mut term)?;
     Ok(())
+}
+
+/// A snapshot of everything that, when changed, moves where inline images sit
+/// on screen: the active buffer, its scroll offset, and which side panels show.
+fn view_key(app: &App) -> (usize, usize, usize, bool, bool) {
+    let scroll = app.active_buffer().map(|b| b.scroll).unwrap_or(0);
+    (app.active.net, app.active.buf, scroll, app.show_sidebar, app.show_members)
 }
 
 fn setup_terminal() -> io::Result<Term> {

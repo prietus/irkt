@@ -227,6 +227,10 @@ pub mod state {
         /// Keyed by `"<network>/<channel-lowercased>"`.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub channel_langs: BTreeMap<String, String>,
+        /// Mention-highlight keywords added live with `/highlight` (merged with
+        /// any in config.toml).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub highlight_keywords: Vec<String>,
     }
 
     fn path() -> Option<PathBuf> {
@@ -259,6 +263,13 @@ pub mod state {
     pub fn save_hide_join_part(hide: bool) -> Result<(), String> {
         let mut st = load();
         st.hide_join_part = Some(hide);
+        store(&st)
+    }
+
+    /// Persist the live `/highlight` keyword list without touching config.toml.
+    pub fn save_highlight_keywords(words: &[String]) -> Result<(), String> {
+        let mut st = load();
+        st.highlight_keywords = words.to_vec();
         store(&st)
     }
 
@@ -334,7 +345,9 @@ channels = ["#rust"]
 # terminal's palette — best legibility on unusual themes), or "nord".
 # Switch live with /theme <name>.
 # theme = "dark"
-# highlight_keywords = ["irkt"]
+# Words (besides your nick) that trigger a mention highlight. You can also
+# manage these live with /highlight add|del <word> (saved to state.toml).
+# highlight_keywords = ["irkt", "murmur"]
 # ignored_nicks = ["spammer42"]
 # inline_images = true
 # link_previews = true

@@ -92,6 +92,18 @@ impl Images {
         self.map.insert(msg.url, st);
     }
 
+    /// True when out-of-band terminal graphics (Kitty / iTerm2 / Sixel) are in
+    /// use and at least one decoded image exists. Such graphics are painted by
+    /// the terminal, not by ratatui's cell buffer, so they aren't erased by the
+    /// usual cell diffing — when the view scrolls or the layout shifts, the
+    /// caller must force a full clear to avoid stale image artifacts. With the
+    /// halfblocks fallback images are plain cells, so this stays false.
+    pub fn graphics_active(&self) -> bool {
+        use ratatui_image::picker::ProtocolType;
+        !matches!(self.picker.protocol_type(), ProtocolType::Halfblocks)
+            && self.map.values().any(|s| matches!(s, ImageState::Ready { .. }))
+    }
+
     /// Number of terminal rows an image of pixel size `w`×`h` needs when drawn
     /// `cols` columns wide, given the detected font cell size.
     pub fn rows_for(&self, w: u32, h: u32, cols: u16) -> u16 {
