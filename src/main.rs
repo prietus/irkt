@@ -4,6 +4,7 @@ mod dict;
 mod images;
 mod irc;
 mod keys;
+mod notify;
 mod spell;
 mod theme;
 mod ui;
@@ -59,6 +60,10 @@ fn main() {
         return;
     }
 
+    // Pin the notification app identity before any worker thread spawns
+    // (matters on macOS; see notify::init).
+    notify::init();
+
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     if let Err(e) = rt.block_on(run(cfg)) {
         eprintln!("fatal: {e}");
@@ -102,6 +107,10 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
     // Likewise the /joins visibility toggle (sidecar) overrides config.toml.
     if let Some(hide) = saved.hide_join_part {
         app.hide_join_part = hide;
+    }
+    // And the /notify desktop-notification toggle (sidecar) overrides config.toml.
+    if let Some(on) = saved.notifications {
+        app.notifications = on;
     }
     app.up_tx = Some(up_tx);
     // Per-channel languages chosen with /lang (sidecar) drive spell-check and

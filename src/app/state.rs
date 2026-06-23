@@ -313,6 +313,9 @@ pub struct App {
     pub link_previews: bool,
     /// Hide join/part/quit lines in channel buffers (toggle with `/joins`).
     pub hide_join_part: bool,
+    /// Send a desktop notification when a highlight lands in an inactive
+    /// buffer (toggle with `/notify`).
+    pub notifications: bool,
     /// File-upload backend config (`/upload`).
     pub upload_cfg: crate::config::UploadConfig,
     /// True while an upload is in flight (prevents overlapping uploads).
@@ -360,6 +363,7 @@ impl App {
         let inline_images = config.inline_images;
         let link_previews = config.link_previews;
         let hide_join_part = config.hide_join_part;
+        let notifications = config.notifications;
         let upload_cfg = config.upload.clone();
         let highlight_keywords = config.highlight_keywords.clone();
         let theme = Theme::by_name(config.theme.as_deref().unwrap_or("dark"));
@@ -375,6 +379,7 @@ impl App {
             inline_images,
             link_previews,
             hide_join_part,
+            notifications,
             upload_cfg,
             uploading: false,
             up_tx: None,

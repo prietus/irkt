@@ -42,6 +42,9 @@ impl App {
         let is_active = self.active.net == net_idx && self.active.buf == buf_idx;
         let mention = line.highlight;
         let counts = !is_active && !matches!(line.kind, LineKind::Self_);
+        // Desktop notification for a highlight in a buffer you're not looking at.
+        // Compute the title/body before `line` moves into the buffer.
+        let notify_info = self.notification_for(net_idx, buf_idx, &line, is_active);
         let buf = &mut self.networks[net_idx].buffers[buf_idx];
         buf.push(line);
         if counts {
@@ -50,6 +53,31 @@ impl App {
                 buf.mentions = buf.mentions.saturating_add(1);
             }
         }
+        if let Some((title, body)) = notify_info {
+            crate::notify::show(title, body);
+        }
+    }
+
+    /// Title/body for a desktop notification, or `None` when one shouldn't fire:
+    /// notifications disabled, the line isn't a highlight, or it landed in the
+    /// buffer the user is currently viewing. (`line.highlight` is already false
+    /// for our own messages, so we never self-notify.)
+    fn notification_for(
+        &self,
+        net_idx: usize,
+        buf_idx: usize,
+        line: &Line,
+        is_active: bool,
+    ) -> Option<(String, String)> {
+        if !self.notifications || is_active || !line.highlight {
+            return None;
+        }
+        let buf = &self.networks[net_idx].buffers[buf_idx];
+        let title = match buf.kind {
+            BufferKind::Query => format!("@{}", line.from),
+            _ => format!("{} — {}", buf.name, line.from),
+        };
+        Some((title, line.text.clone()))
     }
 
     pub fn apply_event(&mut self, net_id: NetId, ev: Event) {
@@ -888,6 +916,36 @@ mod tests {
             meta: meta(),
         });
         assert!(!app.networks[0].buffers[bi].lines.last().unwrap().highlight);
+    }
+
+    #[test]
+    fn notifies_only_on_inactive_highlight() {
+        let mut app = test_app();
+        app.notifications = true;
+        // Channel buffer (index 1); active buffer is the status buffer (0).
+        let bi = app.networks[0].ensure_buffer("#rust", BufferKind::Channel);
+        let hl = Line { highlight: true, from: "alice".into(), text: "me: ping".into(), ..Line::system("") };
+        // Inactive + highlight → notify, titled "<channel> — <nick>".
+        let n = app.notification_for(0, bi, &hl, false);
+        assert_eq!(n, Some(("#rust — alice".into(), "me: ping".into())));
+        // Same line but the buffer is active → no notification.
+        assert!(app.notification_for(0, bi, &hl, true).is_none());
+        // Non-highlight line in an inactive buffer → no notification.
+        let plain = Line { highlight: false, ..hl.clone() };
+        assert!(app.notification_for(0, bi, &plain, false).is_none());
+        // Master switch off → nothing, even on an inactive highlight.
+        app.notifications = false;
+        assert!(app.notification_for(0, bi, &hl, false).is_none());
+    }
+
+    #[test]
+    fn query_notification_titles_with_nick() {
+        let mut app = test_app();
+        app.notifications = true;
+        let bi = app.networks[0].ensure_buffer("alice", BufferKind::Query);
+        let hl = Line { highlight: true, from: "alice".into(), text: "hey".into(), ..Line::system("") };
+        let n = app.notification_for(0, bi, &hl, false);
+        assert_eq!(n, Some(("@alice".into(), "hey".into())));
     }
 
     #[test]

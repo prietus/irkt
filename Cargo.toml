@@ -32,6 +32,9 @@ mime_guess = "2"
 serde_json = "1"
 spellbook = "0.4.2"
 
+# Desktop notifications (D-Bus on Linux, NSUserNotification on macOS, WinRT toast on Windows)
+notify-rust = "4"
+
 [profile.release]
 lto = true
 codegen-units = 1

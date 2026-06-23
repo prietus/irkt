@@ -49,6 +49,10 @@ the [`irc`](https://crates.io/crates/irc) protocol crate, and `tokio`.
 - **Mention highlights** — lines that mention your nick, or any keyword you set
   (`/highlight add irkt murmur`, or `highlight_keywords` in config), are tinted
   and bump the buffer's mention badge. Word-boundary, case-insensitive.
+- **Desktop notifications** — a highlight in a buffer you're *not* currently
+  viewing pops a native notification (D-Bus on Linux, Notification Center on
+  macOS, toast on Windows). Toggle with `/notify`; off-screen only, so you're
+  never notified about the conversation already in front of you.
 - **Autocomplete & spell-check** — as you type, a dim **ghost suggestion**
   completes the current `/command`, channel nick, or — for channels with a
   language set — a dictionary word; `Tab` accepts it. With a language set,
@@ -105,7 +109,7 @@ Add more `[[network]]` blocks to connect to multiple networks.
 ## Commands
 
 `/join /part /msg /query /me /nick /topic /whois /away /mode /kick /invite`
-`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /theme /lang /highlight /upload /react /reply /redact /quit`
+`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /notify /theme /lang /highlight /upload /react /reply /redact /quit`
 
 `/highlight [add|del|clear] <word>…` manages the words (besides your nick) that
 tint a line and bump its mention badge — e.g. `/highlight add irkt murmur`.
@@ -120,6 +124,13 @@ a trailing `/` and a second Tab descends into them.
 
 `/joins [on|off]` toggles whether join/part/quit lines are shown (persisted to
 the sidecar `state.toml`, so your `config.toml` is untouched).
+
+`/notify [on|off]` toggles desktop notifications for highlights that arrive in a
+buffer you're not viewing (persisted to `state.toml`; `notifications` in
+`config.toml` sets the default). On Linux this needs a notification daemon
+(GNOME/KDE/dunst/mako); on macOS and Windows the notification may be attributed
+to your terminal app rather than "irkt" unless irkt is packaged as a signed
+app.
 
 `/lang <code>` sets the spell-check / autocomplete language for the current
 channel or query (e.g. `/lang en`, `/lang es`); `/lang off` disables it and

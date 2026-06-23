@@ -25,6 +25,10 @@ pub struct AppConfig {
     /// Toggle live with `/joins`.
     #[serde(default)]
     pub hide_join_part: bool,
+    /// Send a desktop notification on a highlight in an inactive buffer.
+    /// Toggle live with `/notify`.
+    #[serde(default = "default_true")]
+    pub notifications: bool,
     /// File-upload backend (`/upload`).
     #[serde(default)]
     pub upload: UploadConfig,
@@ -223,6 +227,9 @@ pub mod state {
         /// Join/part/quit visibility toggled live with `/joins` (overrides config.toml).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub hide_join_part: Option<bool>,
+        /// Desktop-notification toggle set live with `/notify` (overrides config.toml).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub notifications: Option<bool>,
         /// Per-buffer language for spell-check/autocomplete, set with `/lang`.
         /// Keyed by `"<network>/<channel-lowercased>"`.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -263,6 +270,13 @@ pub mod state {
     pub fn save_hide_join_part(hide: bool) -> Result<(), String> {
         let mut st = load();
         st.hide_join_part = Some(hide);
+        store(&st)
+    }
+
+    /// Persist the desktop-notification toggle without touching config.toml.
+    pub fn save_notifications(on: bool) -> Result<(), String> {
+        let mut st = load();
+        st.notifications = Some(on);
         store(&st)
     }
 
@@ -354,6 +368,10 @@ channels = ["#rust"]
 # Hide join/part/quit lines (toggle live with /joins). Nick changes are
 # always shown only for people who have spoken recently.
 # hide_join_part = false
+# Desktop notification on a highlight in a buffer you're not viewing (toggle
+# live with /notify). Linux needs a notification daemon; on macOS/Windows the
+# notification may show your terminal's name unless irkt is a packaged app.
+# notifications = true
 
 # === Spell-check & autocomplete =====================================
 # Per-channel, enabled live with /lang <code> (e.g. /lang en, /lang es;

@@ -324,6 +324,19 @@ impl App {
                     self.set_status(format!("join/part/quit lines {}", if show { "shown" } else { "hidden" }));
                 }
             }
+            "notify" => {
+                self.notifications = match rest {
+                    "on" => true,
+                    "off" => false,
+                    _ => !self.notifications,
+                };
+                let s = if self.notifications { "on" } else { "off" };
+                if let Err(e) = crate::config::state::save_notifications(self.notifications) {
+                    self.set_status(format!("desktop notifications {s} (not saved: {e})"));
+                } else {
+                    self.set_status(format!("desktop notifications {s}"));
+                }
+            }
             "react" => {
                 if rest.is_empty() {
                     self.set_status("usage: /react <emoji> — reacts to the selected/last message");
@@ -384,7 +397,7 @@ impl App {
                 self.networks[ni].status_mut().push(Line::system(
                     "commands: /join /part /msg /query /me /nick /topic /whois /away /mode \
                      /kick /invite /raw /names /monitor /setname /close /server /images \
-                     /unfurl /joins /theme /lang /highlight /upload /react /reply /redact /quit",
+                     /unfurl /joins /notify /theme /lang /highlight /upload /react /reply /redact /quit",
                 ));
                 self.active = ActiveBuffer { net: ni, buf: 0 };
             }
