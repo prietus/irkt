@@ -7,6 +7,8 @@ use crate::irc::{Event, MsgMeta, Outgoing, TypingState};
 /// How many recent lines back we look to decide whether a nick has "spoken
 /// recently" before surfacing their nick-change in a channel.
 const NICK_ACTIVITY_WINDOW: usize = 200;
+/// How many messages to request per CHATHISTORY page (LATEST and BEFORE).
+const HISTORY_LIMIT: u32 = 50;
 
 impl App {
     /// True if `body` mentions us or a highlight keyword (case-insensitive,
@@ -121,6 +123,11 @@ impl App {
                     prefixes: String::new(),
                     userhost: None,
                 });
+                // Our own join (including bouncer reconnect): pull recent backlog.
+                if nick.eq_ignore_ascii_case(&net.nick) {
+                    self.request_latest_history(ni, bi);
+                }
+                let net = &mut self.networks[ni];
                 if nick != net.nick {
                     let line = Line {
                         time: String::new(),
@@ -284,9 +291,10 @@ impl App {
                     net.buffers[bi].add_reaction(target_msgid, emoji, nick);
                 }
             }
-            Event::ReadMarker { .. } | Event::ChatHistoryBatchEnd { .. } => {
+            Event::ReadMarker { .. } => {
                 // No dedicated UI yet; safely ignored.
             }
+            Event::ChatHistoryBatchEnd { target } => self.finish_history_batch(ni, &target),
             Event::Presence { nicks, online } => {
                 let net = &mut self.networks[ni];
                 for n in nicks {
@@ -376,10 +384,133 @@ impl App {
             highlight,
             reply_to,
         };
+        // Replayed history (an open `chathistory` batch): stage it for a
+        // chronological prepend when the batch closes, deduped by msgid. It must
+        // not bump unread, clear typing, or count as a live mention.
+        if meta.batch_kind.as_deref() == Some("chathistory") {
+            let buf = &mut self.networks[ni].buffers[bi];
+            if let Some(id) = &line.msgid {
+                let dup = buf.lines.iter().any(|l| l.msgid.as_deref() == Some(id))
+                    || buf.history_stage.iter().any(|l| l.msgid.as_deref() == Some(id));
+                if dup {
+                    return;
+                }
+            }
+            if buf.history_stage.is_empty() {
+                buf.history_stage_oldest_ts = meta.server_time_iso.clone();
+            }
+            buf.history_stage.push(line);
+            return;
+        }
+        // Live message: drop duplicates of one we already have (history overlap
+        // or a double echo). msgids are temporally local, so a recent window
+        // is enough.
+        if let Some(id) = &line.msgid {
+            let buf = &self.networks[ni].buffers[bi];
+            if buf.lines.iter().rev().take(400).any(|l| l.msgid.as_deref() == Some(id)) {
+                return;
+            }
+        }
         // Clear the sender from the typing list.
         let typing = &mut self.networks[ni].buffers[bi].typing;
         typing.retain(|n| !n.eq_ignore_ascii_case(nick));
         self.push_to(ni, bi, line);
+    }
+
+    /// Request the latest backlog for a buffer once (from the bouncer/server via
+    /// `CHATHISTORY LATEST`). No-op for the status buffer, when already loaded /
+    /// loading, or when the network didn't negotiate `draft/chathistory`.
+    fn request_latest_history(&mut self, ni: usize, bi: usize) {
+        if ni >= self.networks.len() || bi == 0 {
+            return;
+        }
+        let net = &mut self.networks[ni];
+        if bi >= net.buffers.len() || !net.caps.iter().any(|c| c == "draft/chathistory") {
+            return;
+        }
+        let buf = &mut net.buffers[bi];
+        if buf.history_loaded
+            || buf.history_loading
+            || !matches!(buf.kind, BufferKind::Channel | BufferKind::Query)
+        {
+            return;
+        }
+        buf.history_loaded = true;
+        buf.history_loading = true;
+        let target = buf.name.clone();
+        let _ = net.out.try_send(Outgoing::ChatHistoryLatest {
+            target,
+            limit: HISTORY_LIMIT,
+        });
+    }
+
+    /// Ensure the active buffer has requested its initial backlog. Called from
+    /// the main loop so it covers channels, queries, and manual buffer switches.
+    pub fn maybe_load_active_history(&mut self) {
+        self.request_latest_history(self.active.net, self.active.buf);
+    }
+
+    /// Act on the renderer's "scrolled to the top" flag by fetching the next
+    /// older page (`CHATHISTORY BEFORE` the oldest message we hold).
+    pub fn request_older_history(&mut self) {
+        let (ni, bi) = (self.active.net, self.active.buf);
+        if ni >= self.networks.len() {
+            return;
+        }
+        let net = &mut self.networks[ni];
+        if bi >= net.buffers.len() {
+            return;
+        }
+        let buf = &mut net.buffers[bi];
+        if !std::mem::take(&mut buf.request_older)
+            || buf.history_loading
+            || buf.history_exhausted
+            || !buf.history_loaded
+        {
+            return;
+        }
+        let Some(before_ts) = buf.oldest_history_ts.clone() else {
+            return;
+        };
+        if !net.caps.iter().any(|c| c == "draft/chathistory") {
+            return;
+        }
+        buf.history_loading = true;
+        let target = buf.name.clone();
+        let _ = net.out.try_send(Outgoing::ChatHistoryBefore {
+            target,
+            before_ts,
+            limit: HISTORY_LIMIT,
+        });
+    }
+
+    /// Finalize an open `chathistory` batch: prepend the staged messages (in
+    /// chronological order) ahead of the buffer's existing lines, advance the
+    /// paging anchor, and mark exhaustion when the server returned a short page.
+    fn finish_history_batch(&mut self, ni: usize, target: &str) {
+        let net = &mut self.networks[ni];
+        let Some(bi) = net.find_buffer(target) else {
+            return;
+        };
+        let buf = &mut net.buffers[bi];
+        buf.history_loading = false;
+        let staged = std::mem::take(&mut buf.history_stage);
+        let oldest = buf.history_stage_oldest_ts.take();
+        if staged.len() < HISTORY_LIMIT as usize {
+            buf.history_exhausted = true;
+        }
+        if staged.is_empty() {
+            return;
+        }
+        if oldest.is_some() {
+            buf.oldest_history_ts = oldest;
+        }
+        // Prepend: staged (older) first, then the existing lines. Scroll is left
+        // untouched — it's measured from the bottom, so the visible region stays
+        // put, and the user simply gains scrollback above.
+        let mut combined = staged;
+        combined.append(&mut buf.lines);
+        buf.lines = combined;
     }
 
     /// Submit the current input line. Returns false on no-op.
@@ -602,6 +733,97 @@ mod tests {
         let net = &app.networks[0];
         assert!(net.find_buffer("#rust").is_some(), "channel buffer should exist");
         assert!(net.members.get("#rust").map(|m| m.len()).unwrap_or(0) >= 1);
+    }
+
+    fn hist_meta(iso: &str, msgid: &str) -> MsgMeta {
+        MsgMeta {
+            server_time_hhmm: Some("00:00".into()),
+            server_time_iso: Some(iso.into()),
+            msgid: Some(msgid.into()),
+            batch_kind: Some("chathistory".into()),
+            ..MsgMeta::default()
+        }
+    }
+
+    fn hist_msg(app: &mut App, target: &str, nick: &str, body: &str, iso: &str, id: &str) {
+        app.apply_event(0, Event::Privmsg {
+            target: target.into(),
+            nick: nick.into(),
+            body: body.into(),
+            meta: hist_meta(iso, id),
+        });
+    }
+
+    #[test]
+    fn chathistory_batch_prepends_in_order_and_dedupes() {
+        let mut app = test_app();
+        let bi = app.networks[0].ensure_buffer("#rust", BufferKind::Channel);
+        // A live message arrives first.
+        app.apply_event(0, Event::Privmsg {
+            target: "#rust".into(), nick: "carol".into(), body: "live".into(),
+            meta: MsgMeta { msgid: Some("C".into()), ..MsgMeta::default() },
+        });
+        // A chathistory batch (older, chronological) — including a dup of the
+        // live message, which must be dropped.
+        hist_msg(&mut app, "#rust", "alice", "first", "t1", "A");
+        hist_msg(&mut app, "#rust", "bob", "second", "t2", "B");
+        hist_msg(&mut app, "#rust", "carol", "live", "t3", "C"); // dup msgid
+        // Nothing committed until the batch closes.
+        assert_eq!(app.networks[0].buffers[bi].lines.len(), 1);
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#rust".into() });
+
+        let buf = &app.networks[0].buffers[bi];
+        let texts: Vec<&str> = buf.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["first", "second", "live"]); // history prepended, dup gone
+        assert_eq!(buf.oldest_history_ts.as_deref(), Some("t1"));
+        assert!(!buf.history_loading);
+        assert!(buf.history_exhausted); // 2 staged < HISTORY_LIMIT
+    }
+
+    #[test]
+    fn older_page_prepends_before_existing_history() {
+        let mut app = test_app();
+        let bi = app.networks[0].ensure_buffer("#rust", BufferKind::Channel);
+        hist_msg(&mut app, "#rust", "a", "mid", "t5", "M");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#rust".into() });
+        // A BEFORE page brings an older message.
+        hist_msg(&mut app, "#rust", "a", "old", "t1", "O");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#rust".into() });
+
+        let buf = &app.networks[0].buffers[bi];
+        let texts: Vec<&str> = buf.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["old", "mid"]);
+        assert_eq!(buf.oldest_history_ts.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn self_join_requests_latest_history() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].caps = vec!["draft/chathistory".into()];
+        app.networks[0].nick = "me".into();
+        app.apply_event(0, Event::UserJoined {
+            channel: "#rust".into(), nick: "me".into(),
+            userhost: None, account: None, realname: None, meta: meta(),
+        });
+        match out_rx.try_recv() {
+            Ok(Outgoing::ChatHistoryLatest { target, limit }) => {
+                assert_eq!(target, "#rust");
+                assert_eq!(limit, HISTORY_LIMIT);
+            }
+            _ => panic!("expected a CHATHISTORY LATEST on self-join"),
+        }
+    }
+
+    #[test]
+    fn no_history_request_without_the_cap() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].nick = "me".into();
+        // caps empty -> no draft/chathistory
+        app.apply_event(0, Event::UserJoined {
+            channel: "#rust".into(), nick: "me".into(),
+            userhost: None, account: None, realname: None, meta: meta(),
+        });
+        assert!(out_rx.try_recv().is_err(), "must not request history without the cap");
     }
 
     #[test]

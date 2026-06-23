@@ -97,6 +97,24 @@ pub struct Buffer {
     /// The msgid of the currently selected message (for reply/react), if any.
     /// Stored by msgid (not index) so it survives buffer truncation.
     pub selection: Option<String>,
+    /// CHATHISTORY messages collected during an open `chathistory` batch, in
+    /// chronological order; prepended to `lines` when the batch closes.
+    pub history_stage: Vec<Line>,
+    /// ISO8601 `time` of the oldest message in the current open batch (the
+    /// first one received), captured for ordering/anchoring.
+    pub history_stage_oldest_ts: Option<String>,
+    /// ISO8601 `time` of the oldest history message loaded so far — the anchor
+    /// for the next `CHATHISTORY BEFORE` page.
+    pub oldest_history_ts: Option<String>,
+    /// True once we've requested the initial `CHATHISTORY LATEST` for this buffer.
+    pub history_loaded: bool,
+    /// A CHATHISTORY request is in flight (suppresses duplicate requests).
+    pub history_loading: bool,
+    /// The server has no older history for this buffer; stop paging.
+    pub history_exhausted: bool,
+    /// Set by the renderer when the viewport is scrolled to the very top, so the
+    /// main loop can fetch an older page. Cleared once acted on.
+    pub request_older: bool,
 }
 
 impl Buffer {
@@ -112,6 +130,13 @@ impl Buffer {
             typing: Vec::new(),
             reactions: std::collections::HashMap::new(),
             selection: None,
+            history_stage: Vec::new(),
+            history_stage_oldest_ts: None,
+            oldest_history_ts: None,
+            history_loaded: false,
+            history_loading: false,
+            history_exhausted: false,
+            request_older: false,
         }
     }
 

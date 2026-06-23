@@ -42,6 +42,10 @@ the [`irc`](https://crates.io/crates/irc) protocol crate, and `tokio`.
 - **Quiet busy channels** — hide join/part/quit churn with `/joins` (or
   `hide_join_part` in config), and "*nick* is now known as …" lines only show
   for people who have actually spoken recently, not silent lurkers.
+- **Backlog / history** — on a bouncer (or any server with `draft/chathistory`,
+  e.g. soju), irkt pulls the recent backlog when you open a channel or query and
+  pages older messages as you scroll to the top — so reconnecting shows the
+  conversation you missed instead of an empty buffer.
 - **Mention highlights** — lines that mention your nick, or any keyword you set
   (`/highlight add irkt murmur`, or `highlight_keywords` in config), are tinted
   and bump the buffer's mention badge. Word-boundary, case-insensitive.

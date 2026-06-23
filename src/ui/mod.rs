@@ -153,19 +153,22 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let (title, topic) = {
+    let (title, topic, loading_history) = {
         let b = &app.networks[ni].buffers[bi];
-        (b.name.clone(), b.topic.clone().unwrap_or_default())
+        (b.name.clone(), b.topic.clone().unwrap_or_default(), b.history_loading)
     };
-    let header_line = RLine::from(vec![
+    let mut header_spans = vec![
         Span::styled(
             format!(" {title} "),
             Style::default().fg(app.theme.header_fg).bg(app.theme.accent).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
-        Span::styled(topic, Style::default().fg(app.theme.dim)),
-    ]);
-    f.render_widget(Paragraph::new(header_line), header);
+    ];
+    if loading_history {
+        header_spans.push(Span::styled("⟳ history… ", Style::default().fg(app.theme.warn)));
+    }
+    header_spans.push(Span::styled(topic, Style::default().fg(app.theme.dim)));
+    f.render_widget(Paragraph::new(RLine::from(header_spans)), header);
 
     let width = body.width as usize;
     let height = body.height as usize;
@@ -285,6 +288,16 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let start = end.saturating_sub(height);
     let visible: Vec<RLine> = rows[start..end].to_vec();
     f.render_widget(Paragraph::new(visible), body);
+
+    // Reaching the top of the scrollback while there's likely more on the server
+    // asks the main loop to fetch an older CHATHISTORY page. Gated on the user
+    // actually having scrolled up (scroll > 0) so short buffers don't auto-page.
+    if start == 0 && scroll > 0 {
+        let buf = &mut app.networks[ni].buffers[bi];
+        if buf.history_loaded && !buf.history_loading && !buf.history_exhausted {
+            buf.request_older = true;
+        }
+    }
 
     // Draw any images whose reserved rows are within the visible window.
     for (rstart, h, cols, url) in placements {
