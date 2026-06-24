@@ -130,6 +130,49 @@ its URL into the composer so you can add a caption before sending. The path
 argument tab-completes against the filesystem (zsh/vim style): directories get
 a trailing `/` and a second Tab descends into them.
 
+By default `/upload` posts to the IRC server's advertised **FILEHOST** endpoint
+(authenticating with your SASL credentials). To use a pastebin / `0x0`-style
+service instead, set `use_custom = true` and describe it under `[upload.custom]`:
+
+```toml
+# x0.at (a 0x0.st clone) — multipart form, replies with the URL as plain text.
+[upload]
+use_custom = true
+
+  [upload.custom]
+  name = "x0.at"
+  url = "https://x0.at"
+  field = "file"          # multipart field name; empty = send raw bytes
+  response_kind = "text"  # how to read the URL back: "text" | "location" | "json"
+```
+
+`response_kind` tells irkt where the resulting URL is in the response:
+
+- `text` — the whole response body *is* the URL (x0.at, 0x0.st).
+- `location` — read it from the `Location` response header.
+- `json` — parse the body as JSON and read `response_key` (default `"url"`).
+
+A couple more shapes:
+
+```toml
+# 0x0.st — same as x0.at.
+  [upload.custom]
+  name = "0x0"
+  url = "https://0x0.st"
+  field = "file"
+  response_kind = "text"
+
+# A token-protected JSON API (e.g. a self-hosted uploader). The token is sent
+# as a Bearer header; the URL is read from the named JSON key.
+  [upload.custom]
+  name = "myhost"
+  url = "https://files.example.com/api/upload"
+  token = "your-api-token"
+  field = "file"
+  response_kind = "json"
+  response_key = "url"     # e.g. {"url": "https://files.example.com/abc.png"}
+```
+
 `/joins [on|off]` toggles whether join/part/quit lines are shown (persisted to
 the sidecar `state.toml`, so your `config.toml` is untouched).
 
