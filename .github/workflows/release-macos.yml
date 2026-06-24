@@ -1,0 +1,106 @@
+name: release-macos
+
+# Builds, signs (Developer ID) and notarizes the macOS arm64 binary, then
+# attaches the zip to the GitHub release for the pushed tag.
+#
+# Required repo secrets (set with `gh secret set`):
+#   Signing:
+#     MACOS_CERT_P12          base64 of your "Developer ID Application" .p12
+#     MACOS_CERT_PASSWORD     password you set when exporting that .p12
+#     MACOS_KEYCHAIN_PASSWORD any password (for the temporary CI keychain)
+#     MACOS_SIGN_IDENTITY     e.g. "Developer ID Application: Your Name (TEAMID)"
+#   Notarization (Apple ID method):
+#     AC_APPLE_ID             your Apple ID email
+#     AC_PASSWORD             an app-specific password (appleid.apple.com)
+#     AC_TEAM_ID              your 10-char Team ID
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build & attach the binary to"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macos-14 is Apple Silicon, so `cargo build --release` is arm64 natively.
+    runs-on: macos-14
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release, arm64)
+        run: cargo build --release --locked
+
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          CERT="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$CERT"
+
+          # Create an isolated, short-lived keychain so we never touch the
+          # runner's defaults, and make it the default for this job.
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -P "$MACOS_CERT_PASSWORD" \
+            -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          # Allow codesign to use the key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Put our keychain first in the search list (keeps the login one too).
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | sed 's/[”"]//g')
+
+      - name: Sign (hardened runtime + secure timestamp)
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          BIN=target/release/irkt
+          codesign --force --timestamp --options runtime \
+            --sign "$MACOS_SIGN_IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+
+      - name: Notarize
+        env:
+          AC_APPLE_ID: ${{ secrets.AC_APPLE_ID }}
+          AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
+          AC_TEAM_ID: ${{ secrets.AC_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          ASSET="irkt-${TAG}-macos-arm64.zip"
+          # notarytool only accepts a container (zip/dmg/pkg), not a bare binary.
+          ditto -c -k --keepParent target/release/irkt "$ASSET"
+          xcrun notarytool submit "$ASSET" \
+            --apple-id "$AC_APPLE_ID" \
+            --password "$AC_PASSWORD" \
+            --team-id "$AC_TEAM_ID" \
+            --wait
+          # A standalone CLI binary can't be stapled (only .app/.dmg/.pkg can),
+          # so Gatekeeper verifies the notarization online on first run. We ship
+          # the same notarized zip we submitted.
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --title "$TAG" --generate-notes \
+            || echo "release $TAG already exists"
+          gh release upload "$TAG" "$ASSET" --clobber
