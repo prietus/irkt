@@ -4,11 +4,10 @@ name: release-macos
 # attaches the zip to the GitHub release for the pushed tag.
 #
 # Required repo secrets (set with `gh secret set`):
-#   Signing:
+#   Signing (the identity name is read from the cert, so no secret for it):
 #     MACOS_CERT_P12          base64 of your "Developer ID Application" .p12
 #     MACOS_CERT_PASSWORD     password you set when exporting that .p12
 #     MACOS_KEYCHAIN_PASSWORD any password (for the temporary CI keychain)
-#     MACOS_SIGN_IDENTITY     e.g. "Developer ID Application: Your Name (TEAMID)"
 #   Notarization (Apple ID method):
 #     AC_APPLE_ID             your Apple ID email
 #     AC_PASSWORD             an app-specific password (appleid.apple.com)
@@ -48,38 +47,44 @@ jobs:
           MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
-          CERT="$RUNNER_TEMP/cert.p12"
-          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
-          echo "$MACOS_CERT_P12" | base64 --decode > "$CERT"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          echo -n "$MACOS_CERT_P12" | base64 --decode -o "$CERT_PATH"
 
           # Create an isolated, short-lived keychain so we never touch the
-          # runner's defaults, and make it the default for this job.
-          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          # Import the whole identity (cert + private key). Do NOT pass
-          # `-t cert`: with a .p12 that restricts the import to the certificate
-          # and drops the key, leaving no usable signing identity.
-          security import "$CERT" -P "$MACOS_CERT_PASSWORD" \
-            -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
-          # Allow codesign to use the key without an interactive prompt.
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          # Put our keychain first in the search list (keeps the login one too).
-          security list-keychains -d user -s "$KEYCHAIN" \
-            $(security list-keychains -d user | sed 's/[”"]//g')
-          # Fail fast (and log the available names) if no identity landed — e.g.
-          # the .p12 was exported without its private key.
-          security find-identity -v -p codesigning "$KEYCHAIN"
+          # runner's defaults.
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Import the whole identity (cert + private key). `-A` lets codesign
+          # use the key without an ACL prompt; do NOT pass `-t cert`, which would
+          # import only the certificate and drop the key.
+          security import "$CERT_PATH" -P "$MACOS_CERT_PASSWORD" \
+            -A -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          echo "Identities in build keychain:"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Sign (hardened runtime + secure timestamp)
-        env:
-          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
+          # Derive the identity name straight from the keychain — no secret to
+          # keep in sync, so it can never mismatch the imported certificate.
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | awk -F\" '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$IDENTITY" ]; then
+            echo "No Developer ID Application identity in the keychain." >&2
+            echo "Is MACOS_CERT_P12 a Developer ID Application cert exported WITH its private key?" >&2
+            exit 1
+          fi
+          echo "Signing with: $IDENTITY"
           BIN=target/release/irkt
-          codesign --force --timestamp --options runtime \
-            --sign "$MACOS_SIGN_IDENTITY" "$BIN"
+          codesign --force --timestamp --options runtime --sign "$IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
 
       - name: Notarize
@@ -110,3 +115,10 @@ jobs:
           gh release create "$TAG" --title "$TAG" --generate-notes \
             || echo "release $TAG already exists"
           gh release upload "$TAG" "$ASSET" --clobber
+
+      - name: Clean up keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN_PATH:-}" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
