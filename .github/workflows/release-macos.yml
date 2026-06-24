@@ -57,14 +57,20 @@ jobs:
           security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Import the whole identity (cert + private key). Do NOT pass
+          # `-t cert`: with a .p12 that restricts the import to the certificate
+          # and drops the key, leaving no usable signing identity.
           security import "$CERT" -P "$MACOS_CERT_PASSWORD" \
-            -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+            -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
           # Allow codesign to use the key without an interactive prompt.
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN"
           # Put our keychain first in the search list (keeps the login one too).
           security list-keychains -d user -s "$KEYCHAIN" \
             $(security list-keychains -d user | sed 's/[”"]//g')
+          # Fail fast (and log the available names) if no identity landed — e.g.
+          # the .p12 was exported without its private key.
+          security find-identity -v -p codesigning "$KEYCHAIN"
 
       - name: Sign (hardened runtime + secure timestamp)
         env:
