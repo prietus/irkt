@@ -300,7 +300,6 @@ impl Network {
 }
 
 pub struct App {
-    pub config: AppConfig,
     pub networks: Vec<Network>,
     pub active: ActiveBuffer,
     pub input: String,
@@ -349,6 +348,12 @@ pub struct App {
     /// Words (besides your nick) that trigger a mention highlight. Seeded from
     /// `config.highlight_keywords`, edited live with `/highlight`.
     pub highlight_keywords: Vec<String>,
+    /// Nicks hidden entirely from every buffer. Seeded from
+    /// `config.ignored_nicks`, edited live with `/ignore`.
+    pub ignored_nicks: Vec<String>,
+    /// Nicks whose lines render dimmed (a soft ignore). Seeded from
+    /// `config.dimmed_nicks`, edited live with `/dim`.
+    pub dimmed_nicks: Vec<String>,
 }
 
 pub struct Completion {
@@ -366,9 +371,10 @@ impl App {
         let notifications = config.notifications;
         let upload_cfg = config.upload.clone();
         let highlight_keywords = config.highlight_keywords.clone();
+        let ignored_nicks = config.ignored_nicks.clone();
+        let dimmed_nicks = config.dimmed_nicks.clone();
         let theme = Theme::by_name(config.theme.as_deref().unwrap_or("dark"));
         App {
-            config,
             networks: Vec::new(),
             active: ActiveBuffer { net: 0, buf: 0 },
             input: String::new(),
@@ -393,6 +399,8 @@ impl App {
             spellers: std::collections::HashMap::new(),
             channel_langs: std::collections::HashMap::new(),
             highlight_keywords,
+            ignored_nicks,
+            dimmed_nicks,
         }
     }
 

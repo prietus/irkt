@@ -12,9 +12,13 @@ pub struct AppConfig {
     /// Extra keywords (besides your nick) that count as a highlight/mention.
     #[serde(default)]
     pub highlight_keywords: Vec<String>,
-    /// Nicks hidden completely from every buffer.
+    /// Nicks hidden completely from every buffer. Manage live with `/ignore`.
     #[serde(default)]
     pub ignored_nicks: Vec<String>,
+    /// Nicks whose messages are shown but dimmed (a soft ignore). Manage live
+    /// with `/dim`.
+    #[serde(default)]
+    pub dimmed_nicks: Vec<String>,
     /// Render inline images by default. Toggle live with `/images`.
     #[serde(default = "default_true")]
     pub inline_images: bool,
@@ -238,6 +242,14 @@ pub mod state {
         /// any in config.toml).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub highlight_keywords: Vec<String>,
+        /// Fully-hidden nicks managed live with `/ignore` (merged with
+        /// config.toml's `ignored_nicks`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub ignored_nicks: Vec<String>,
+        /// Soft-ignored (dimmed) nicks managed live with `/dim` (merged with
+        /// config.toml's `dimmed_nicks`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub dimmed_nicks: Vec<String>,
     }
 
     fn path() -> Option<PathBuf> {
@@ -284,6 +296,20 @@ pub mod state {
     pub fn save_highlight_keywords(words: &[String]) -> Result<(), String> {
         let mut st = load();
         st.highlight_keywords = words.to_vec();
+        store(&st)
+    }
+
+    /// Persist the live `/ignore` nick list without touching config.toml.
+    pub fn save_ignored_nicks(nicks: &[String]) -> Result<(), String> {
+        let mut st = load();
+        st.ignored_nicks = nicks.to_vec();
+        store(&st)
+    }
+
+    /// Persist the live `/dim` nick list without touching config.toml.
+    pub fn save_dimmed_nicks(nicks: &[String]) -> Result<(), String> {
+        let mut st = load();
+        st.dimmed_nicks = nicks.to_vec();
         store(&st)
     }
 
@@ -362,7 +388,11 @@ channels = ["#rust"]
 # Words (besides your nick) that trigger a mention highlight. You can also
 # manage these live with /highlight add|del <word> (saved to state.toml).
 # highlight_keywords = ["irkt", "murmur"]
+# Hide these nicks entirely (manage live with /ignore add|del <nick>).
 # ignored_nicks = ["spammer42"]
+# Show these nicks but dimmed — a subtle soft-ignore (manage live with
+# /dim add|del <nick>).
+# dimmed_nicks = ["chatty_bot"]
 # inline_images = true
 # link_previews = true
 # Hide join/part/quit lines (toggle live with /joins). Nick changes are

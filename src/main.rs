@@ -125,6 +125,17 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
             app.highlight_keywords.push(w.clone());
         }
     }
+    // Likewise the live /ignore and /dim nick lists merge with config.toml.
+    for n in &saved.ignored_nicks {
+        if !app.ignored_nicks.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+            app.ignored_nicks.push(n.clone());
+        }
+    }
+    for n in &saved.dimmed_nicks {
+        if !app.dimmed_nicks.iter().any(|x| x.eq_ignore_ascii_case(n)) {
+            app.dimmed_nicks.push(n.clone());
+        }
+    }
     for (id, net_cfg) in cfg.networks.iter().enumerate() {
         if !net_cfg.autoconnect {
             continue;

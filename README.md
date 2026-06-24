@@ -41,7 +41,9 @@ the [`irc`](https://crates.io/crates/irc) protocol crate, and `tokio`.
   under `[upload.custom]`.
 - **Quiet busy channels** — hide join/part/quit churn with `/joins` (or
   `hide_join_part` in config), and "*nick* is now known as …" lines only show
-  for people who have actually spoken recently, not silent lurkers.
+  for people who have actually spoken recently, not silent lurkers. Mute a
+  specific person with `/ignore <nick>` (hidden entirely) or `/dim <nick>`
+  (a soft ignore — their lines stay visible but dimmed).
 - **Backlog / history** — on a bouncer (or any server with `draft/chathistory`,
   e.g. soju), irkt pulls the recent backlog when you open a channel or query and
   pages older messages as you scroll to the top — so reconnecting shows the
@@ -109,7 +111,13 @@ Add more `[[network]]` blocks to connect to multiple networks.
 ## Commands
 
 `/join /part /msg /query /me /nick /topic /whois /away /mode /kick /invite`
-`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /notify /theme /lang /highlight /upload /react /reply /redact /quit`
+`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /notify /theme /lang /highlight /ignore /dim /upload /react /reply /redact /quit`
+
+`/ignore [add|del|list|clear] <nick>…` hides a nick's messages entirely;
+`/dim [add|del|list|clear] <nick>…` is a softer version that still shows them
+but dimmed (legible, just muted). A bare `/ignore <nick>` or `/dim <nick>` is
+shorthand for `add`. Both lists persist to `state.toml` and merge with
+`ignored_nicks` / `dimmed_nicks` in `config.toml`.
 
 `/highlight [add|del|clear] <word>…` manages the words (besides your nick) that
 tint a line and bump its mention badge — e.g. `/highlight add irkt murmur`.

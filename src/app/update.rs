@@ -30,8 +30,7 @@ impl App {
     }
 
     fn ignored(&self, nick: &str) -> bool {
-        self.config
-            .ignored_nicks
+        self.ignored_nicks
             .iter()
             .any(|n| n.eq_ignore_ascii_case(nick))
     }

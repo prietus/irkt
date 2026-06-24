@@ -4,6 +4,30 @@
 use super::state::*;
 use crate::irc::{MonitorCmd, Outgoing};
 
+/// Which per-nick list a `/ignore` or `/dim` command operates on.
+#[derive(Clone, Copy)]
+enum NickList {
+    /// `/ignore` — hide the nick's messages entirely.
+    Ignore,
+    /// `/dim` — show the nick's messages but dimmed (a soft ignore).
+    Dim,
+}
+
+impl NickList {
+    fn cmd(self) -> &'static str {
+        match self {
+            NickList::Ignore => "ignore",
+            NickList::Dim => "dim",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            NickList::Ignore => "ignored",
+            NickList::Dim => "dimmed",
+        }
+    }
+}
+
 /// Expand a leading `~` or `~/` to the user's home directory.
 pub(crate) fn expand_tilde(path: &str) -> std::path::PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -337,6 +361,8 @@ impl App {
                     self.set_status(format!("desktop notifications {s}"));
                 }
             }
+            "ignore" => self.cmd_nick_list(NickList::Ignore, rest),
+            "dim" => self.cmd_nick_list(NickList::Dim, rest),
             "react" => {
                 if rest.is_empty() {
                     self.set_status("usage: /react <emoji> — reacts to the selected/last message");
@@ -397,7 +423,7 @@ impl App {
                 self.networks[ni].status_mut().push(Line::system(
                     "commands: /join /part /msg /query /me /nick /topic /whois /away /mode \
                      /kick /invite /raw /names /monitor /setname /close /server /images \
-                     /unfurl /joins /notify /theme /lang /highlight /upload /react /reply /redact /quit",
+                     /unfurl /joins /notify /theme /lang /highlight /ignore /dim /upload /react /reply /redact /quit",
                 ));
                 self.active = ActiveBuffer { net: ni, buf: 0 };
             }
@@ -470,6 +496,89 @@ impl App {
             format!("highlight words: {}", self.highlight_keywords.join(", "))
         };
         match crate::config::state::save_highlight_keywords(&self.highlight_keywords) {
+            Ok(()) => self.set_status(summary),
+            Err(e) => self.set_status(format!("{summary} (not saved: {e})")),
+        }
+    }
+
+    fn nick_list_mut(&mut self, which: NickList) -> &mut Vec<String> {
+        match which {
+            NickList::Ignore => &mut self.ignored_nicks,
+            NickList::Dim => &mut self.dimmed_nicks,
+        }
+    }
+
+    /// Shared `add|del|list|clear` logic for `/ignore` (hard hide) and `/dim`
+    /// (soft, dimmed). A bare `/ignore nick` is shorthand for `add`. Both lists
+    /// persist to the sidecar `state.toml`, so `config.toml` is untouched.
+    fn cmd_nick_list(&mut self, which: NickList, rest: &str) {
+        let (sub, args) = match rest.split_once(char::is_whitespace) {
+            Some((s, a)) => (s.to_lowercase(), a.trim()),
+            None => (rest.to_lowercase(), ""),
+        };
+        match sub.as_str() {
+            "" | "list" => {
+                let list = self.nick_list_mut(which);
+                if list.is_empty() {
+                    let (cmd, label) = (which.cmd(), which.label());
+                    self.set_status(format!("no {label} nicks (add with /{cmd} add <nick>)"));
+                } else {
+                    let s = format!("{} nicks: {}", which.label(), list.join(", "));
+                    self.set_status(s);
+                }
+                return;
+            }
+            "add" | "+" => {
+                let nicks: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+                if nicks.is_empty() {
+                    self.set_status(format!("usage: /{} add <nick>...", which.cmd()));
+                    return;
+                }
+                let list = self.nick_list_mut(which);
+                for n in nicks {
+                    if !list.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                        list.push(n);
+                    }
+                }
+            }
+            "del" | "-" | "rm" | "remove" => {
+                let nicks: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+                if nicks.is_empty() {
+                    self.set_status(format!("usage: /{} del <nick>...", which.cmd()));
+                    return;
+                }
+                self.nick_list_mut(which)
+                    .retain(|x| !nicks.iter().any(|n| n.eq_ignore_ascii_case(x)));
+            }
+            "clear" => {
+                self.nick_list_mut(which).clear();
+            }
+            // Bare `/ignore foo` (or `/dim foo`) is shorthand for `add`.
+            _ => {
+                let nicks: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+                let list = self.nick_list_mut(which);
+                for n in nicks {
+                    if !list.iter().any(|x| x.eq_ignore_ascii_case(&n)) {
+                        list.push(n);
+                    }
+                }
+            }
+        }
+        self.persist_nick_list(which);
+    }
+
+    fn persist_nick_list(&mut self, which: NickList) {
+        let list = self.nick_list_mut(which).clone();
+        let summary = if list.is_empty() {
+            format!("{} nicks cleared", which.label())
+        } else {
+            format!("{} nicks: {}", which.label(), list.join(", "))
+        };
+        let res = match which {
+            NickList::Ignore => crate::config::state::save_ignored_nicks(&list),
+            NickList::Dim => crate::config::state::save_dimmed_nicks(&list),
+        };
+        match res {
             Ok(()) => self.set_status(summary),
             Err(e) => self.set_status(format!("{summary} (not saved: {e})")),
         }

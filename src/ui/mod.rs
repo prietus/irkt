@@ -182,6 +182,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let inline = app.inline_images;
     let unfurl = app.link_previews;
     let hide_join_part = app.hide_join_part;
+    let dimmed = app.dimmed_nicks.clone();
     let img_cols = (body.width).min(IMAGE_MAX_COLS).max(1);
 
     // First, ensure a fetch is in flight for any URL in this buffer. Whether
@@ -257,6 +258,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             inline,
             unfurl,
             images: &app.images,
+            dimmed: &dimmed,
         };
         for i in 0..lines.len() {
             if is_child[i] {
@@ -342,6 +344,8 @@ struct RenderCtx<'a> {
     inline: bool,
     unfurl: bool,
     images: &'a crate::images::Images,
+    /// Nicks whose lines render dimmed (soft ignore via `/dim`).
+    dimmed: &'a [String],
 }
 
 /// Render one message and, recursively, its threaded replies nested beneath it.
@@ -362,6 +366,15 @@ fn push_message(
     } else {
         render_reply_child(line, depth, ctx.width, t)
     };
+    // Soft-ignore: recolor a dimmed nick's whole line to the muted tone and
+    // drop the bold, so it stays legible but recedes (set with `/dim`).
+    if ctx.dimmed.iter().any(|n| n.eq_ignore_ascii_case(&line.from)) {
+        for rl in &mut these {
+            for sp in &mut rl.spans {
+                sp.style = sp.style.fg(t.dim).remove_modifier(Modifier::BOLD);
+            }
+        }
+    }
     if is_selected {
         // Highlight the whole message — reverse-video on adaptive themes, a
         // background bar otherwise.
@@ -960,5 +973,61 @@ mod render_tests {
             (0..area.width).any(|x| buf[(x, y)].style().bg == Some(sel_bg))
         });
         assert!(any_sel_bg, "dark theme selects with a background bar");
+    }
+
+    #[test]
+    fn dimmed_nick_renders_muted() {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        for (time, who, txt) in [("12:00", "alice", "hi all"), ("12:01", "bob", "spam spam")] {
+            app.networks[0].buffers[bi].push(Line {
+                time: time.into(), kind: LineKind::Message, from: who.into(),
+                text: txt.into(), msgid: None, highlight: false, reply_to: None,
+            });
+        }
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = false;
+        app.show_sidebar = false;
+        app.dimmed_nicks = vec!["bob".into()];
+        let theme = crate::theme::dark();
+        app.theme = theme.clone();
+
+        let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let area = *buf.area();
+
+        // alice isn't dimmed, so her per-nick color still shows somewhere.
+        let alice_color = theme.nick("alice");
+        let alice_shown = (0..area.height).any(|y| {
+            (0..area.width).any(|x| buf[(x, y)].style().fg == Some(alice_color))
+        });
+        assert!(alice_shown, "a non-dimmed nick keeps its bright color");
+
+        // bob is dimmed: his whole line is recolored to the muted dim tone,
+        // with no bold left on the nick.
+        let mut found = false;
+        for y in 0..area.height {
+            let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if !row.contains("bob") {
+                continue;
+            }
+            found = true;
+            for x in 0..area.width {
+                let cell = &buf[(x, y)];
+                if cell.symbol().trim().is_empty() {
+                    continue;
+                }
+                assert_eq!(cell.style().fg, Some(theme.dim), "dimmed row uses the muted tone");
+                assert!(!cell.style().add_modifier.contains(Modifier::BOLD), "dimmed row drops bold");
+            }
+        }
+        assert!(found, "bob's line should be on screen");
     }
 }
