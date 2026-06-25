@@ -46,6 +46,37 @@ const WANT_EXTRA_CAPS: &[&str] = &[
     "draft/sasl-ir",
 ];
 
+/// Append a line to `irkt.log` next to `config.toml`, timestamped in local
+/// time. A temporary diagnostic to capture *why* the connection drops — every
+/// connect/disconnect funnels through here so the exact reason and cadence are
+/// on disk to read back later.
+fn diag_log(net: &str, msg: &str) {
+    let Some(dir) = crate::config::config_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    else {
+        return;
+    };
+    let off = time::UtcOffset::from_whole_seconds(crate::local_offset_secs() as i32)
+        .unwrap_or(time::UtcOffset::UTC);
+    let t = time::OffsetDateTime::now_utc().to_offset(off);
+    let ts = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second(),
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("irkt.log"))
+    {
+        let _ = writeln!(f, "{ts} [{net}] {msg}");
+    }
+}
+
 #[derive(Debug, Clone)]
 struct BatchInfo {
     kind: String,
@@ -123,6 +154,13 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
     // Reconnect loop. Each iteration is one connection attempt.
     let mut attempt: u32 = 0;
     loop {
+        diag_log(
+            &cfg.name,
+            &format!(
+                "connecting to {}:{} (tls={}, attempt={})",
+                cfg.server, cfg.port, cfg.use_tls, attempt
+            ),
+        );
         if use_sasl {
             let mech = match auth_mode {
                 AuthMode::SaslExternal => "EXTERNAL",
@@ -150,6 +188,13 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
             client_cert_pass: cfg.client_cert_pass.clone(),
             version: Some(format!("irkt {} — terminal IRC client", env!("CARGO_PKG_VERSION"))),
             source: Some("https://github.com/".into()),
+            // The crate sends its own PING every `ping_time`s and drops the
+            // link if no PONG arrives within `ping_timeout`s — but it only
+            // checks while we're polling the socket. A wider grace window is
+            // cheap insurance so a brief UI hiccup can't be misread as a dead
+            // connection (the real fix is coalescing redraws in the UI loop).
+            ping_time: Some(120),
+            ping_timeout: Some(60),
             ..Config::default()
         };
 
@@ -199,6 +244,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                                         auth_phase = AuthPhase::Done;
                                         let acked: Vec<String> = cap_state.acked.iter().cloned().collect();
                                         let _ = out.send(Event::CapsAcked(acked)).await;
+                                        diag_log(&cfg.name, "connected");
                                         let _ = out.send(Event::Connected).await;
                                         attempt = 0;
                                     }
@@ -217,6 +263,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                                                 meta: MsgMeta::default(),
                                             }).await;
                                         }
+                                        diag_log(&cfg.name, "connected");
                                         let _ = out.send(Event::Connected).await;
                                         attempt = 0;
                                     }
@@ -349,11 +396,15 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                                 });
                             }
                             Some(Outgoing::Quit(reason)) => {
+                                diag_log(&cfg.name, &format!("QUIT requested (reason={reason:?})"));
                                 let _ = sender.send(Command::QUIT(reason));
                                 let _ = out.send(Event::Disconnected).await;
                                 return;
                             }
-                            None => return,
+                            None => {
+                                diag_log(&cfg.name, "outgoing channel closed — worker ending");
+                                return;
+                            }
                         }
                     }
                 }
@@ -362,11 +413,13 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
 
         match outcome {
             AttemptOutcome::Fatal(e) => {
+                diag_log(&cfg.name, &format!("FATAL: {e}"));
                 let _ = out.send(Event::ConnectError(e)).await;
                 return;
             }
             AttemptOutcome::Recoverable(e) => {
                 let secs = backoff_secs(attempt);
+                diag_log(&cfg.name, &format!("RECOVERABLE disconnect: {e} (reconnect in {secs}s)"));
                 attempt = attempt.saturating_add(1);
                 let _ = out
                     .send(Event::Notice {

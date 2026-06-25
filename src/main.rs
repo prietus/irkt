@@ -218,18 +218,40 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
     term.draw(|f| ui::draw(f, &mut app))?;
     let mut view = view_key(&app);
 
-    while let Some(tick) = tick_rx.recv().await {
-        let resized = matches!(tick, Tick::Resize);
-        match tick {
-            Tick::Key(key) => {
-                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    keys::handle_key(&mut app, key);
+    while let Some(first) = tick_rx.recv().await {
+        // Drain the just-received tick *plus* everything already queued and
+        // redraw only once for the whole batch. A redraw of the full TUI is
+        // far more expensive than applying an event, so redrawing per-event
+        // (the old behaviour) made the UI drain slowly during bursts —
+        // history loads, big-channel joins, netsplits. While it lagged, a
+        // worker would sit blocked on its full event channel, stop reading
+        // its socket, and miss the server's PONG; the `irc` crate then
+        // reports a ping timeout and drops the connection ("connection reset:
+        // no ping response"). Coalescing keeps the workers' sockets readable.
+        let mut resized = false;
+        let mut batch = Some(first);
+        // Cap so a sustained flood can't starve the screen of redraws forever.
+        let mut budget = 1024u32;
+        while let Some(tick) = batch.take() {
+            match tick {
+                Tick::Key(key) => {
+                    if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                        keys::handle_key(&mut app, key);
+                    }
                 }
+                Tick::Resize => resized = true,
+                Tick::Irc(id, ev) => app.apply_event(id, ev),
+                Tick::Image(msg) => app.images.apply(msg),
+                Tick::Upload(msg) => app.on_upload_finished(msg),
             }
-            Tick::Resize => {}
-            Tick::Irc(id, ev) => app.apply_event(id, ev),
-            Tick::Image(msg) => app.images.apply(msg),
-            Tick::Upload(msg) => app.on_upload_finished(msg),
+            if app.should_quit {
+                break;
+            }
+            budget -= 1;
+            if budget == 0 {
+                break;
+            }
+            batch = tick_rx.try_recv().ok();
         }
         if app.should_quit {
             break;
