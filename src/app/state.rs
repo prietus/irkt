@@ -368,6 +368,12 @@ pub struct App {
     /// Horizontal extent `(x_start, x_end)` of the chat message area, so a click
     /// is only treated as a message hit when `x_start <= x < x_end`.
     pub chat_x: (u16, u16),
+    /// Clickable member-list rows, recorded each draw for mouse hit-testing:
+    /// `(screen row y, nick)`. Empty when the member panel is hidden. Only
+    /// populated/used when `mouse = true`.
+    pub member_rows: Vec<(u16, String)>,
+    /// Horizontal extent `(x_start, x_end)` of the member panel's clickable area.
+    pub member_x: (u16, u16),
 }
 
 pub struct Completion {
@@ -419,6 +425,8 @@ impl App {
             sidebar_w: 0,
             chat_rows: Vec::new(),
             chat_x: (0, 0),
+            member_rows: Vec::new(),
+            member_x: (0, 0),
         }
     }
 
@@ -429,6 +437,18 @@ impl App {
             self.active = ActiveBuffer { net, buf };
             self.mark_active_read();
         }
+    }
+
+    /// Open (or focus) a private-message buffer with `nick` on the active
+    /// network. Used by mouse clicks on the member list.
+    pub fn open_query(&mut self, nick: &str) {
+        let ni = self.active.net;
+        if self.networks.get(ni).is_none() {
+            return;
+        }
+        let bi = self.networks[ni].ensure_buffer(nick, BufferKind::Query);
+        self.active = ActiveBuffer { net: ni, buf: bi };
+        self.mark_active_read();
     }
 
     pub fn net(&self, id: NetId) -> Option<usize> {

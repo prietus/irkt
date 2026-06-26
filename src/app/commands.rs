@@ -214,6 +214,15 @@ impl App {
                     reason,
                 });
             }
+            // Operator convenience commands (need channel-op privileges to take
+            // effect; the server rejects them otherwise). All map to a MODE on
+            // the active channel for one or more nicks/masks.
+            "op" => self.channel_member_mode('+', 'o', rest, "usage: /op <nick> [nick…]"),
+            "deop" => self.channel_member_mode('-', 'o', rest, "usage: /deop <nick> [nick…]"),
+            "voice" => self.channel_member_mode('+', 'v', rest, "usage: /voice <nick> [nick…]"),
+            "devoice" => self.channel_member_mode('-', 'v', rest, "usage: /devoice <nick> [nick…]"),
+            "ban" => self.channel_member_mode('+', 'b', rest, "usage: /ban <nick|mask> […]"),
+            "unban" => self.channel_member_mode('-', 'b', rest, "usage: /unban <nick|mask> […]"),
             "invite" => {
                 let mut parts = rest.split_whitespace();
                 let Some(nick) = parts.next() else {
@@ -690,6 +699,28 @@ impl App {
             return Some(sel.clone());
         }
         buf.lines.iter().rev().find_map(|l| l.msgid.clone())
+    }
+
+    /// Apply a per-member channel mode (`+o`, `-v`, `+b`, …) to one or more
+    /// nicks/masks on the active channel. IRC lets several flags ride a single
+    /// MODE, e.g. `MODE #chan +oo alice bob`.
+    fn channel_member_mode(&mut self, sign: char, mode: char, rest: &str, usage: &str) {
+        let Some(chan) = self.active_channel() else {
+            self.set_status("not in a channel");
+            return;
+        };
+        let targets: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+        if targets.is_empty() {
+            self.set_status(usage);
+            return;
+        }
+        let modes = format!("{sign}{}", mode.to_string().repeat(targets.len()));
+        let ni = self.active.net;
+        let _ = self.networks[ni].out.try_send(Outgoing::Mode {
+            target: chan,
+            modes,
+            args: targets,
+        });
     }
 
     /// The active buffer's channel name, if it is a channel.

@@ -186,8 +186,13 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
             nick_password: if use_sasl { None } else { cfg.nick_password.clone() },
             client_cert_path: cfg.client_cert_path.clone(),
             client_cert_pass: cfg.client_cert_pass.clone(),
-            version: Some(format!("irkt {} — terminal IRC client", env!("CARGO_PKG_VERSION"))),
-            source: Some("https://github.com/".into()),
+            // CTCP VERSION / SOURCE auto-replies (handled by the crate): the
+            // client name + version and the project's GitHub URL.
+            version: Some(format!(
+                "irkt {} — terminal IRC client — https://github.com/prietus/irkt",
+                env!("CARGO_PKG_VERSION")
+            )),
+            source: Some("https://github.com/prietus/irkt".into()),
             // The crate sends its own PING every `ping_time`s and drops the
             // link if no PONG arrives within `ping_timeout`s — but it only
             // checks while we're polling the socket. A wider grace window is

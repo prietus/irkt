@@ -67,6 +67,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_chat(f, chat_area, app);
     if show_members {
         draw_members(f, cols[idx], app);
+    } else {
+        // Member panel hidden: drop stale click targets.
+        app.member_rows.clear();
+        app.member_x = (0, 0);
     }
 
     draw_input(f, input_row, app);
@@ -703,12 +707,16 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn draw_members(f: &mut Frame, area: Rect, app: &App) {
+fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
+    // Repopulated below; cleared up-front so an early return (no members) can't
+    // leave stale click targets on screen.
+    app.member_rows.clear();
     let t = &app.theme;
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(t.dim));
     let inner = block.inner(area);
+    app.member_x = (inner.x, inner.x + inner.width);
     f.render_widget(block, area);
 
     let Some(net) = app.active_net() else { return };
@@ -723,6 +731,9 @@ fn draw_members(f: &mut Frame, area: Rect, app: &App) {
         pa.cmp(&pb).then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
     });
 
+    // Clickable rows, recorded for mouse hit-testing (the Paragraph doesn't
+    // wrap, so line index `i` lands on screen row `inner.y + i`).
+    let mut hits: Vec<(u16, String)> = Vec::new();
     let mut lines: Vec<RLine> = Vec::new();
     lines.push(RLine::from(Span::styled(
         format!("{} members", sorted.len()),
@@ -736,12 +747,17 @@ fn draw_members(f: &mut Frame, area: Rect, app: &App) {
             '+' => t.good,
             _ => t.dim,
         };
+        let y = inner.y + lines.len() as u16;
+        if y < inner.y + inner.height {
+            hits.push((y, m.nick.clone()));
+        }
         lines.push(RLine::from(vec![
             Span::styled(prefix.to_string(), Style::default().fg(pcolor)),
             Span::styled(m.nick.clone(), Style::default().fg(t.nick(&m.nick))),
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
+    app.member_rows = hits;
 }
 
 fn prefix_rank(prefixes: &str) -> u8 {
@@ -1101,6 +1117,46 @@ mod render_tests {
         // A click left of the chat area (in the sidebar) is not a message hit.
         crate::keys::click(&mut app, 1, y);
         assert_eq!(app.active_buffer().unwrap().selection, None);
+    }
+
+    #[test]
+    fn member_click_opens_query() {
+        use crate::irc::MemberEntry;
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        app.networks[0].members.insert(
+            "#chan".into(),
+            vec![
+                MemberEntry { nick: "alice".into(), prefixes: "@".into(), userhost: None },
+                MemberEntry { nick: "bob".into(), prefixes: String::new(), userhost: None },
+            ],
+        );
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = true;
+
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        // Each member got a clickable row inside the member panel's x-range.
+        let &(y, ref nick) = app
+            .member_rows
+            .iter()
+            .find(|(_, n)| n == "bob")
+            .expect("bob should have a clickable member row");
+        assert_eq!(nick, "bob");
+        let mx = app.member_x.0 + 1;
+        crate::keys::click(&mut app, mx, y);
+
+        // A query buffer with bob is now open and active.
+        let active = app.active_buffer().unwrap();
+        assert_eq!(active.name, "bob");
+        assert!(matches!(active.kind, BufferKind::Query));
     }
 
     #[test]

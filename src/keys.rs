@@ -136,14 +136,24 @@ fn reconcile_typing(app: &mut App, key: &KeyEvent, ctrl: bool, alt: bool) {
     }
 }
 
-/// Handle a left-click at screen cell `(x, y)`. The sidebar switches buffers; a
-/// click on a chat message selects it (clicking the selected one again clears
-/// the selection). Coordinates outside any known target are ignored.
+/// Handle a left-click at screen cell `(x, y)`. The sidebar switches buffers, a
+/// click on a member opens a PM with that nick, and a click on a chat message
+/// selects it (clicking the selected one again clears the selection).
+/// Coordinates outside any known target are ignored.
 pub(crate) fn click(app: &mut App, x: u16, y: u16) {
     if x < app.sidebar_w {
         if let Some(&(_, net, buf)) = app.sidebar_rows.iter().find(|&&(ry, _, _)| ry == y) {
             app.select_buffer(net, buf);
         }
+        return;
+    }
+    // A click on a member-list nick opens (or focuses) a private-message buffer.
+    if x >= app.member_x.0
+        && x < app.member_x.1
+        && let Some((_, nick)) = app.member_rows.iter().find(|(ry, _)| *ry == y)
+    {
+        let nick = nick.clone();
+        app.open_query(&nick);
         return;
     }
     // A click inside the chat area selects (or toggles off) that message.
@@ -342,6 +352,7 @@ fn complete_path(word: &str) -> Vec<String> {
 
 pub(crate) const COMMANDS: &[&str] = &[
     "join", "part", "msg", "query", "me", "nick", "topic", "whois", "away", "mode", "kick",
+    "op", "deop", "voice", "devoice", "ban", "unban",
     "invite", "raw", "names", "monitor", "buddy", "setname", "close", "server", "images",
     "unfurl", "joins", "notify", "theme", "lang", "highlight", "ignore", "dim", "upload", "react", "reply", "redact", "quit",
     "help",
