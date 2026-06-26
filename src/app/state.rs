@@ -354,6 +354,20 @@ pub struct App {
     /// Nicks whose lines render dimmed (a soft ignore). Seeded from
     /// `config.dimmed_nicks`, edited live with `/dim`.
     pub dimmed_nicks: Vec<String>,
+    /// Clickable sidebar buffer rows, recorded each draw for mouse hit-testing:
+    /// `(screen row y, network index, buffer index)`. Empty when the sidebar is
+    /// hidden. Only populated/used when `mouse = true`.
+    pub sidebar_rows: Vec<(u16, usize, usize)>,
+    /// Width in columns of the sidebar's clickable area (its inner width, from
+    /// x=0). A click with `x < sidebar_w` is inside the sidebar. 0 when hidden.
+    pub sidebar_w: u16,
+    /// Clickable chat message rows, recorded each draw for mouse hit-testing:
+    /// `(screen row y, msgid)`. Only rows of selectable (msgid-carrying) messages
+    /// currently on screen. Only populated/used when `mouse = true`.
+    pub chat_rows: Vec<(u16, String)>,
+    /// Horizontal extent `(x_start, x_end)` of the chat message area, so a click
+    /// is only treated as a message hit when `x_start <= x < x_end`.
+    pub chat_x: (u16, u16),
 }
 
 pub struct Completion {
@@ -401,6 +415,19 @@ impl App {
             highlight_keywords,
             ignored_nicks,
             dimmed_nicks,
+            sidebar_rows: Vec::new(),
+            sidebar_w: 0,
+            chat_rows: Vec::new(),
+            chat_x: (0, 0),
+        }
+    }
+
+    /// Switch the active buffer to `(net, buf)` if it exists, marking it read.
+    /// Used by mouse clicks on the sidebar.
+    pub fn select_buffer(&mut self, net: usize, buf: usize) {
+        if self.networks.get(net).and_then(|n| n.buffers.get(buf)).is_some() {
+            self.active = ActiveBuffer { net, buf };
+            self.mark_active_read();
         }
     }
 

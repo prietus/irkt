@@ -56,6 +56,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.show_sidebar {
         draw_sidebar(f, cols[idx], app);
         idx += 1;
+    } else {
+        // No sidebar this frame: drop any stale click targets so a click can't
+        // hit a row that's no longer on screen.
+        app.sidebar_rows.clear();
+        app.sidebar_w = 0;
     }
     let chat_area = cols[idx];
     idx += 1;
@@ -68,7 +73,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_status(f, status_row, app);
 }
 
-fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
+fn draw_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
     let t = &app.theme;
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -76,6 +81,10 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Screen rows of clickable buffer entries, for mouse hit-testing. The
+    // Paragraph below doesn't wrap, so line index `i` lands on screen row
+    // `inner.y + i`.
+    let mut hits: Vec<(u16, usize, usize)> = Vec::new();
     let mut lines: Vec<RLine> = Vec::new();
     for (ni, net) in app.networks.iter().enumerate() {
         let sel_net = ni == app.active.net;
@@ -117,6 +126,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
             } else if buf.unread > 0 {
                 spans.push(Span::styled(format!(" ({})", buf.unread), Style::default().fg(t.dim)));
             }
+            hits.push((inner.y + lines.len() as u16, ni, bi));
             lines.push(RLine::from(spans));
         }
         // Buddy presence (MONITOR), if any are configured.
@@ -139,9 +149,16 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
         lines.push(RLine::from(""));
     }
     f.render_widget(Paragraph::new(lines), inner);
+    // Only rows actually on screen are clickable (the Paragraph clips the rest).
+    hits.retain(|&(y, _, _)| y < inner.y + inner.height);
+    app.sidebar_rows = hits;
+    app.sidebar_w = inner.width;
 }
 
 fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
+    // Drop last frame's click targets; they're repopulated below unless an
+    // early return leaves the chat empty.
+    app.chat_rows.clear();
     // Topic / header row + messages.
     let parts = Layout::default()
         .direction(Direction::Vertical)
@@ -221,6 +238,9 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     // (row_start, height_rows, width_cols, url)
     let mut placements: Vec<(usize, u16, u16, String)> = Vec::new();
     let mut sel_range: Option<(usize, usize)> = None;
+    // (buffer row index, msgid) for selectable messages, converted to screen
+    // coordinates after the viewport window is known.
+    let mut row_msgids: Vec<(usize, String)> = Vec::new();
     {
         let buf = &app.networks[ni].buffers[bi];
         let lines = &buf.lines;
@@ -270,7 +290,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             {
                 continue;
             }
-            push_message(&ctx, i, 0, &mut rows, &mut placements, &mut sel_range);
+            push_message(&ctx, i, 0, &mut rows, &mut placements, &mut sel_range, &mut row_msgids);
         }
     }
 
@@ -293,6 +313,14 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let start = end.saturating_sub(height);
     let visible: Vec<RLine> = rows[start..end].to_vec();
     f.render_widget(Paragraph::new(visible), body);
+
+    // Record where each selectable message landed on screen, for mouse clicks.
+    app.chat_x = (body.x, body.x + body.width);
+    app.chat_rows = row_msgids
+        .into_iter()
+        .filter(|&(ri, _)| ri >= start && ri < end)
+        .map(|(ri, mid)| (body.y + (ri - start) as u16, mid))
+        .collect();
 
     // Reaching the top of the scrollback while there's likely more on the server
     // asks the main loop to fetch an older CHATHISTORY page. Gated on the user
@@ -356,6 +384,7 @@ fn push_message(
     rows: &mut Vec<RLine<'static>>,
     placements: &mut Vec<(usize, u16, u16, String)>,
     sel_range: &mut Option<(usize, usize)>,
+    row_msgids: &mut Vec<(usize, String)>,
 ) {
     let t = ctx.theme;
     let line = &ctx.lines[idx];
@@ -447,11 +476,19 @@ fn push_message(
         }
     }
 
+    // Map this message's own rows (text + image + reaction badge, before any
+    // nested replies) to its msgid, so a mouse click on them selects it.
+    if let Some(mid) = &line.msgid {
+        for r in row_start..rows.len() {
+            row_msgids.push((r, mid.clone()));
+        }
+    }
+
     // Nested replies (depth-capped as a guard against pathological chains).
     if depth < 8 {
         if let Some(kids) = ctx.children.get(&idx) {
             for &k in kids {
-                push_message(ctx, k, depth + 1, rows, placements, sel_range);
+                push_message(ctx, k, depth + 1, rows, placements, sel_range, row_msgids);
             }
         }
     }
@@ -799,14 +836,29 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(format!(" {msg} "), Style::default().fg(t.header_fg).bg(t.warn)));
     }
     if spans.is_empty() {
-        let net = app.active_net().map(|n| n.cfg.name.as_str()).unwrap_or("-");
-        let nick = app.active_net().map(|n| n.nick.as_str()).unwrap_or("-");
-        let attach = if app.has_upload_target() { " · 📎 /upload" } else { "" };
-        let spell = if app.active_lang().is_some() { " · ⌥S fix" } else { "" };
-        spans.push(Span::styled(
-            format!(" irkt · {net} · {nick}  —  ^N/^P switch · ⌥↑↓ select · ⌥R react{attach}{spell} · Tab complete · ^C quit"),
-            Style::default().fg(t.dim),
-        ));
+        // A selected (or react-target) message gets an action hint in place of
+        // the generic help line — the workflow isn't obvious when you've just
+        // clicked a message with the mouse rather than used ⌥↑↓.
+        if app.react_mode {
+            spans.push(Span::styled(
+                " react: insert an emoji, then Enter · Esc cancel ",
+                Style::default().fg(t.special).add_modifier(Modifier::BOLD),
+            ));
+        } else if app.active_buffer().is_some_and(|b| b.selection.is_some()) {
+            spans.push(Span::styled(
+                " message selected — type to reply · ⌥R react · Esc cancel ",
+                Style::default().fg(t.special).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            let net = app.active_net().map(|n| n.cfg.name.as_str()).unwrap_or("-");
+            let nick = app.active_net().map(|n| n.nick.as_str()).unwrap_or("-");
+            let attach = if app.has_upload_target() { " · 📎 /upload" } else { "" };
+            let spell = if app.active_lang().is_some() { " · ⌥S fix" } else { "" };
+            spans.push(Span::styled(
+                format!(" irkt · {net} · {nick}  —  ^N/^P switch · ⌥↑↓ select · ⌥R react{attach}{spell} · Tab complete · ^C quit"),
+                Style::default().fg(t.dim),
+            ));
+        }
     }
     f.render_widget(
         Paragraph::new(RLine::from(spans)).style(Style::default().bg(t.statusbar_bg)),
@@ -973,6 +1025,119 @@ mod render_tests {
             (0..area.width).any(|x| buf[(x, y)].style().bg == Some(sel_bg))
         });
         assert!(any_sel_bg, "dark theme selects with a background bar");
+    }
+
+    #[test]
+    fn selected_message_shows_action_hint() {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        app.networks[0].buffers[bi].push(Line {
+            time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
+            text: "hi".into(), msgid: Some("m1".into()), highlight: false, reply_to: None,
+        });
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = false;
+
+        // No selection: the status bar shows the generic help line.
+        let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(buffer_to_string(&term).contains("^N/^P switch"), "generic help when nothing selected");
+
+        // With a message selected, the hint replaces the help line.
+        app.networks[0].buffers[bi].selection = Some("m1".into());
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(buffer_to_string(&term).contains("type to reply"), "selection shows the reply/react hint");
+
+        // In react mode, the hint switches to the emoji instruction.
+        app.react_mode = true;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(buffer_to_string(&term).contains("insert an emoji"), "react mode shows the emoji hint");
+    }
+
+    #[test]
+    fn chat_click_selects_message() {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        // A message with a msgid (selectable) and one without (not selectable).
+        app.networks[0].buffers[bi].push(Line {
+            time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
+            text: "click me".into(), msgid: Some("m1".into()), highlight: false, reply_to: None,
+        });
+        app.networks[0].buffers[bi].push(Line {
+            time: "12:01".into(), kind: LineKind::System, from: "".into(),
+            text: "no msgid here".into(), msgid: None, highlight: false, reply_to: None,
+        });
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = false;
+
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        // The selectable message got a clickable row; the system line did not.
+        let &(y, ref mid) = app.chat_rows.first().expect("a selectable message row");
+        assert_eq!(mid, "m1");
+        assert!(app.chat_rows.iter().all(|(_, m)| m == "m1"), "only msgid lines are clickable");
+
+        // Click selects it; clicking again toggles the selection off.
+        let chat_x0 = app.chat_x.0;
+        crate::keys::click(&mut app, chat_x0 + 2, y);
+        assert_eq!(app.active_buffer().unwrap().selection.as_deref(), Some("m1"));
+        let y2 = app.chat_rows.iter().find(|(_, m)| m == "m1").unwrap().0;
+        crate::keys::click(&mut app, chat_x0 + 2, y2);
+        assert_eq!(app.active_buffer().unwrap().selection, None, "second click deselects");
+
+        // A click left of the chat area (in the sidebar) is not a message hit.
+        crate::keys::click(&mut app, 1, y);
+        assert_eq!(app.active_buffer().unwrap().selection, None);
+    }
+
+    #[test]
+    fn sidebar_click_switches_buffer() {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        // status (buf 0) + two channels.
+        app.networks[0].ensure_buffer("#one", BufferKind::Channel);
+        let two = app.networks[0].ensure_buffer("#two", BufferKind::Channel);
+        app.active = ActiveBuffer { net: 0, buf: 0 };
+        app.show_members = false;
+
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        // The draw recorded a clickable row for #two; clicking it activates it.
+        let &(y, net, buf) = app
+            .sidebar_rows
+            .iter()
+            .find(|&&(_, n, b)| n == 0 && b == two)
+            .expect("#two should have a clickable sidebar row");
+        assert!(app.sidebar_w > 0, "sidebar width recorded");
+        crate::keys::click(&mut app, 2, y);
+        assert_eq!((app.active.net, app.active.buf), (net, buf));
+
+        // A click in the chat area (past the sidebar) must not switch buffers,
+        // even when it shares a row with a sidebar entry. Reset to status first
+        // so a no-op is distinguishable from a switch.
+        app.active = ActiveBuffer { net: 0, buf: 0 };
+        let chat_x = app.sidebar_w + 5;
+        crate::keys::click(&mut app, chat_x, y);
+        assert_eq!((app.active.net, app.active.buf), (0, 0), "chat-area click is ignored");
     }
 
     #[test]

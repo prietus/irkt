@@ -13,7 +13,10 @@ mod upload;
 use std::io::{self, Stdout};
 use std::sync::OnceLock;
 
-use crossterm::event::{Event as CEvent, EventStream, KeyEventKind};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as CEvent, EventStream, KeyEventKind,
+    MouseButton, MouseEventKind,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
 use futures::StreamExt;
@@ -79,6 +82,12 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 enum Tick {
     Key(crossterm::event::KeyEvent),
     Resize,
+    /// Mouse wheel notch: +1 scrolls up (into history), -1 down. Only emitted
+    /// when `mouse = true` in config (otherwise the mouse isn't captured).
+    Scroll(i32),
+    /// Left-click at a screen cell `(column, row)`. Only emitted when
+    /// `mouse = true`.
+    Click(u16, u16),
     Irc(usize, IrcEvent),
     Image(ImageMsg),
     Upload(upload::UploadMsg),
@@ -201,6 +210,14 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
                 let tick = match item {
                     Ok(CEvent::Key(k)) => Some(Tick::Key(k)),
                     Ok(CEvent::Resize(_, _)) => Some(Tick::Resize),
+                    Ok(CEvent::Mouse(m)) => match m.kind {
+                        MouseEventKind::ScrollUp => Some(Tick::Scroll(1)),
+                        MouseEventKind::ScrollDown => Some(Tick::Scroll(-1)),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            Some(Tick::Click(m.column, m.row))
+                        }
+                        _ => None,
+                    },
                     Ok(_) => None,
                     Err(_) => break,
                 };
@@ -214,7 +231,7 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
     }
     drop(tick_tx);
 
-    let mut term = setup_terminal()?;
+    let mut term = setup_terminal(cfg.mouse)?;
     term.draw(|f| ui::draw(f, &mut app))?;
     let mut view = view_key(&app);
 
@@ -240,6 +257,8 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
                     }
                 }
                 Tick::Resize => resized = true,
+                Tick::Scroll(notches) => keys::scroll(&mut app, notches * 3),
+                Tick::Click(x, y) => keys::click(&mut app, x, y),
                 Tick::Irc(id, ev) => app.apply_event(id, ev),
                 Tick::Image(msg) => app.images.apply(msg),
                 Tick::Upload(msg) => app.on_upload_finished(msg),
@@ -272,7 +291,7 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         app.request_older_history();
     }
 
-    restore_terminal(&mut term)?;
+    restore_terminal(&mut term, cfg.mouse)?;
     Ok(())
 }
 
@@ -283,18 +302,26 @@ fn view_key(app: &App) -> (usize, usize, usize, bool, bool) {
     (app.active.net, app.active.buf, scroll, app.show_sidebar, app.show_members)
 }
 
-fn setup_terminal() -> io::Result<Term> {
+fn setup_terminal(mouse: bool) -> io::Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // Capturing the mouse lets the wheel scroll the buffer, at the cost of the
+    // terminal's native text selection (the user opts in via `mouse = true`).
+    if mouse {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
     term.clear()?;
     Ok(term)
 }
 
-fn restore_terminal(term: &mut Term) -> io::Result<()> {
+fn restore_terminal(term: &mut Term, mouse: bool) -> io::Result<()> {
     disable_raw_mode()?;
+    if mouse {
+        execute!(term.backend_mut(), DisableMouseCapture)?;
+    }
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
     Ok(())

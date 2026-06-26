@@ -33,6 +33,11 @@ pub struct AppConfig {
     /// Toggle live with `/notify`.
     #[serde(default = "default_true")]
     pub notifications: bool,
+    /// Capture the mouse so the wheel scrolls the active buffer. Off by default
+    /// because capturing the mouse disables the terminal's own text selection /
+    /// copy (hold Shift — or Option in some terminals — to select while on).
+    #[serde(default)]
+    pub mouse: bool,
     /// File-upload backend (`/upload`).
     #[serde(default)]
     pub upload: UploadConfig,
@@ -402,6 +407,9 @@ channels = ["#rust"]
 # live with /notify). Linux needs a notification daemon; on macOS/Windows the
 # notification may show your terminal's name unless irkt is a packaged app.
 # notifications = true
+# Capture the mouse so the wheel scrolls the active buffer. While this is on,
+# selecting text to copy needs Shift held down (Option in some terminals).
+# mouse = false
 
 # === Spell-check & autocomplete =====================================
 # Per-channel, enabled live with /lang <code> (e.g. /lang en, /lang es;

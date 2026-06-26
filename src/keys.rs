@@ -136,7 +136,33 @@ fn reconcile_typing(app: &mut App, key: &KeyEvent, ctrl: bool, alt: bool) {
     }
 }
 
-fn scroll(app: &mut App, delta: i32) {
+/// Handle a left-click at screen cell `(x, y)`. The sidebar switches buffers; a
+/// click on a chat message selects it (clicking the selected one again clears
+/// the selection). Coordinates outside any known target are ignored.
+pub(crate) fn click(app: &mut App, x: u16, y: u16) {
+    if x < app.sidebar_w {
+        if let Some(&(_, net, buf)) = app.sidebar_rows.iter().find(|&&(ry, _, _)| ry == y) {
+            app.select_buffer(net, buf);
+        }
+        return;
+    }
+    // A click inside the chat area selects (or toggles off) that message.
+    if x >= app.chat_x.0
+        && x < app.chat_x.1
+        && let Some((_, mid)) = app.chat_rows.iter().find(|(ry, _)| *ry == y)
+    {
+        let mid = mid.clone();
+        if let Some(buf) = app.active_buffer_mut() {
+            buf.selection = if buf.selection.as_deref() == Some(mid.as_str()) {
+                None
+            } else {
+                Some(mid)
+            };
+        }
+    }
+}
+
+pub(crate) fn scroll(app: &mut App, delta: i32) {
     if let Some(buf) = app.active_buffer_mut() {
         let max = buf.lines.len();
         let new = (buf.scroll as i32 + delta).clamp(0, max as i32);
