@@ -273,9 +273,9 @@ impl App {
                 let bname = if net.is_channel(&target) { target } else { nick.clone() };
                 if let Some(bi) = net.find_buffer(&bname) {
                     let typing = &mut net.buffers[bi].typing;
-                    typing.retain(|n| !n.eq_ignore_ascii_case(&nick));
+                    typing.retain(|(n, _)| !n.eq_ignore_ascii_case(&nick));
                     if matches!(state, TypingState::Active) {
-                        typing.push(nick);
+                        typing.push((nick, std::time::Instant::now()));
                     }
                 }
             }
@@ -440,7 +440,7 @@ impl App {
         }
         // Clear the sender from the typing list.
         let typing = &mut self.networks[ni].buffers[bi].typing;
-        typing.retain(|n| !n.eq_ignore_ascii_case(nick));
+        typing.retain(|(n, _)| !n.eq_ignore_ascii_case(nick));
         self.push_to(ni, bi, line);
     }
 
@@ -701,6 +701,25 @@ impl App {
             target,
             state: TypingState::Done,
         });
+    }
+
+    /// Drop typing indicators whose last `+typing=active` is older than the
+    /// spec's window. A sender refreshes `active` every 3s while typing, so 6s
+    /// without a refresh means they stopped (or the `done`/peer was lost) and
+    /// the "… is typing" line would otherwise stick forever. Returns true if
+    /// anything was removed, so the caller knows a redraw is warranted.
+    pub fn expire_typing(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let mut changed = false;
+        for net in &mut self.networks {
+            for buf in &mut net.buffers {
+                let before = buf.typing.len();
+                buf.typing
+                    .retain(|(_, since)| now.duration_since(*since).as_secs() < 6);
+                changed |= buf.typing.len() != before;
+            }
+        }
+        changed
     }
 }
 
@@ -1230,14 +1249,44 @@ mod tests {
             nick: "alice".into(),
             state: TypingState::Active,
         });
-        assert_eq!(app.networks[0].buffers[bi].typing, vec!["alice".to_string()]);
+        let names: Vec<_> = app.networks[0].buffers[bi]
+            .typing
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert_eq!(names, vec!["alice".to_string()]);
         // Our own typing, echoed back by the server, does not.
         app.apply_event(0, Event::TypingChanged {
             target: "#c".into(),
             nick: "me".into(),
             state: TypingState::Active,
         });
-        assert_eq!(app.networks[0].buffers[bi].typing, vec!["alice".to_string()]);
+        let names: Vec<_> = app.networks[0].buffers[bi]
+            .typing
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        assert_eq!(names, vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn stale_typing_indicator_expires() {
+        let (mut app, _out) = app_with_outbox();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        // A fresh active indicator survives a sweep.
+        app.apply_event(0, Event::TypingChanged {
+            target: "#c".into(),
+            nick: "alice".into(),
+            state: TypingState::Active,
+        });
+        assert!(!app.expire_typing());
+        assert_eq!(app.networks[0].buffers[bi].typing.len(), 1);
+        // Backdate it past the 6s window: the next sweep reaps it and reports
+        // the change so the caller knows to redraw.
+        let old = std::time::Instant::now() - std::time::Duration::from_secs(7);
+        app.networks[0].buffers[bi].typing[0].1 = old;
+        assert!(app.expire_typing());
+        assert!(app.networks[0].buffers[bi].typing.is_empty());
     }
 
     #[test]

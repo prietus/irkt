@@ -91,6 +91,9 @@ enum Tick {
     Irc(usize, IrcEvent),
     Image(ImageMsg),
     Upload(upload::UploadMsg),
+    /// Periodic wake-up so time-based UI state (e.g. expiring a stale
+    /// `… is typing` indicator) gets reaped even when nothing else happens.
+    Tock,
 }
 
 async fn run(cfg: config::AppConfig) -> io::Result<()> {
@@ -200,6 +203,21 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         });
     }
 
+    // Heartbeat so time-based UI state expires on its own. Cheap: the loop
+    // only redraws on a tock if something actually changed (see expire_typing).
+    {
+        let tx = tick_tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                ticker.tick().await;
+                if tx.send(Tick::Tock).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     // Dedicated terminal-input reader. Owning the EventStream in its own task
     // means its reads are never cancelled by other branches.
     {
@@ -246,6 +264,9 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         // reports a ping timeout and drops the connection ("connection reset:
         // no ping response"). Coalescing keeps the workers' sockets readable.
         let mut resized = false;
+        // A bare heartbeat (Tock) only forces a redraw when it actually reaps
+        // something; every other tick changes visible state, so redraw.
+        let mut need_redraw = false;
         let mut batch = Some(first);
         // Cap so a sustained flood can't starve the screen of redraws forever.
         let mut budget = 1024u32;
@@ -255,13 +276,33 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
                     if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                         keys::handle_key(&mut app, key);
                     }
+                    need_redraw = true;
                 }
-                Tick::Resize => resized = true,
-                Tick::Scroll(notches) => keys::scroll(&mut app, notches * 3),
-                Tick::Click(x, y) => keys::click(&mut app, x, y),
-                Tick::Irc(id, ev) => app.apply_event(id, ev),
-                Tick::Image(msg) => app.images.apply(msg),
-                Tick::Upload(msg) => app.on_upload_finished(msg),
+                Tick::Resize => {
+                    resized = true;
+                    need_redraw = true;
+                }
+                Tick::Scroll(notches) => {
+                    keys::scroll(&mut app, notches * 3);
+                    need_redraw = true;
+                }
+                Tick::Click(x, y) => {
+                    keys::click(&mut app, x, y);
+                    need_redraw = true;
+                }
+                Tick::Irc(id, ev) => {
+                    app.apply_event(id, ev);
+                    need_redraw = true;
+                }
+                Tick::Image(msg) => {
+                    app.images.apply(msg);
+                    need_redraw = true;
+                }
+                Tick::Upload(msg) => {
+                    app.on_upload_finished(msg);
+                    need_redraw = true;
+                }
+                Tick::Tock => need_redraw |= app.expire_typing(),
             }
             if app.should_quit {
                 break;
@@ -274,6 +315,9 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         }
         if app.should_quit {
             break;
+        }
+        if !need_redraw {
+            continue;
         }
         // Inline images drawn with a terminal graphics protocol aren't erased by
         // ratatui's cell diffing, so a scroll / buffer switch / panel toggle /

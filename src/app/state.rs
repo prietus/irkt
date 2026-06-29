@@ -90,8 +90,10 @@ pub struct Buffer {
     pub unread: u32,
     pub mentions: u32,
     pub topic: Option<String>,
-    /// Nicks currently typing (draft/typing), most-recent last.
-    pub typing: Vec<String>,
+    /// Nicks currently typing (draft/typing) with the instant their last
+    /// `+typing=active` arrived, most-recent last. The timestamp lets us expire
+    /// a stale indicator if the peer's `done` is lost (or it just vanishes).
+    pub typing: Vec<(String, std::time::Instant)>,
     /// Reactions keyed by the reacted message's msgid: emoji -> nicks.
     pub reactions: std::collections::HashMap<String, Vec<(String, Vec<String>)>>,
     /// The msgid of the currently selected message (for reply/react), if any.

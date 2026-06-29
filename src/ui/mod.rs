@@ -839,9 +839,8 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let mut spans = Vec::new();
     if let Some(buf) = app.active_buffer() {
         if !buf.typing.is_empty() {
-            let who = buf.typing.join(", ");
             let txt = if buf.typing.len() == 1 {
-                format!(" {who} is typing… ")
+                format!(" {} is typing… ", buf.typing[0].0)
             } else {
                 format!(" {} are typing… ", buf.typing.len())
             };
