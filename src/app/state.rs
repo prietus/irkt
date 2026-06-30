@@ -314,8 +314,8 @@ pub struct App {
     pub link_previews: bool,
     /// Hide join/part/quit lines in channel buffers (toggle with `/joins`).
     pub hide_join_part: bool,
-    /// Send a desktop notification when a highlight lands in an inactive
-    /// buffer (toggle with `/notify`).
+    /// Send a desktop notification for a private message, or a highlight in an
+    /// inactive buffer (toggle with `/notify`).
     pub notifications: bool,
     /// File-upload backend config (`/upload`).
     pub upload_cfg: crate::config::UploadConfig,

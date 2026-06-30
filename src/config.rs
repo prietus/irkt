@@ -29,8 +29,9 @@ pub struct AppConfig {
     /// Toggle live with `/joins`.
     #[serde(default)]
     pub hide_join_part: bool,
-    /// Send a desktop notification on a highlight in an inactive buffer.
-    /// Toggle live with `/notify`.
+    /// Send a desktop notification for a private message, or a highlight (your
+    /// nick or a watched keyword) in an inactive buffer. Toggle live with
+    /// `/notify`.
     #[serde(default = "default_true")]
     pub notifications: bool,
     /// Capture the mouse so the wheel scrolls the active buffer. Off by default
@@ -403,9 +404,10 @@ channels = ["#rust"]
 # Hide join/part/quit lines (toggle live with /joins). Nick changes are
 # always shown only for people who have spoken recently.
 # hide_join_part = false
-# Desktop notification on a highlight in a buffer you're not viewing (toggle
-# live with /notify). Linux needs a notification daemon; on macOS/Windows the
-# notification may show your terminal's name unless irkt is a packaged app.
+# Desktop notification for a private message, or a highlight (your nick or a
+# word from highlight_keywords) in a buffer you're not viewing (toggle live with
+# /notify). Linux needs a notification daemon; on macOS/Windows the notification
+# may show your terminal's name unless irkt is a packaged app.
 # notifications = true
 # Capture the mouse so the wheel scrolls the active buffer. While this is on,
 # selecting text to copy needs Shift held down (Option in some terminals).

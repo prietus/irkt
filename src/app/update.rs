@@ -57,10 +57,12 @@ impl App {
         }
     }
 
-    /// Title/body for a desktop notification, or `None` when one shouldn't fire:
-    /// notifications disabled, the line isn't a highlight, or it landed in the
-    /// buffer the user is currently viewing. (`line.highlight` is already false
-    /// for our own messages, so we never self-notify.)
+    /// Title/body for a desktop notification, or `None` when one shouldn't fire.
+    /// Two things notify: a private message (it's addressed to you), and a
+    /// highlight in a channel — your nick or a watched keyword. Either way we
+    /// skip it when notifications are off, when you're already looking at that
+    /// buffer, and for anything that isn't a real incoming message from someone
+    /// else (our own echo is `Self_`; joins/system lines aren't `Message`).
     fn notification_for(
         &self,
         net_idx: usize,
@@ -68,10 +70,15 @@ impl App {
         line: &Line,
         is_active: bool,
     ) -> Option<(String, String)> {
-        if !self.notifications || is_active || !line.highlight {
+        if !self.notifications || is_active {
             return None;
         }
         let buf = &self.networks[net_idx].buffers[buf_idx];
+        let is_pm = matches!(buf.kind, BufferKind::Query)
+            && matches!(line.kind, LineKind::Message | LineKind::Action);
+        if !line.highlight && !is_pm {
+            return None;
+        }
         let title = match buf.kind {
             BufferKind::Query => format!("@{}", line.from),
             _ => format!("{} — {}", buf.name, line.from),
@@ -964,6 +971,31 @@ mod tests {
         let hl = Line { highlight: true, from: "alice".into(), text: "hey".into(), ..Line::system("") };
         let n = app.notification_for(0, bi, &hl, false);
         assert_eq!(n, Some(("@alice".into(), "hey".into())));
+    }
+
+    #[test]
+    fn plain_pm_notifies_without_a_mention() {
+        let mut app = test_app();
+        app.notifications = true;
+        let bi = app.networks[0].ensure_buffer("alice", BufferKind::Query);
+        // A private message that never names you still notifies — it's a PM.
+        let pm = Line {
+            kind: LineKind::Message,
+            highlight: false,
+            from: "alice".into(),
+            text: "you around?".into(),
+            ..Line::system("")
+        };
+        assert_eq!(
+            app.notification_for(0, bi, &pm, false),
+            Some(("@alice".into(), "you around?".into()))
+        );
+        // Our own echo into the query (Self_) must not notify.
+        let echo = Line { kind: LineKind::Self_, from: "me".into(), ..pm.clone() };
+        assert!(app.notification_for(0, bi, &echo, false).is_none());
+        // A system line in the query (e.g. a notice) doesn't either.
+        let sys = Line { from: "alice".into(), ..Line::system("alice is away") };
+        assert!(app.notification_for(0, bi, &sys, false).is_none());
     }
 
     #[test]
