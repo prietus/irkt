@@ -4,6 +4,7 @@
 //! (OpenGraph / Twitter / `<title>`), keyed by URL.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use image::GenericImageView;
 use ratatui_image::picker::Picker;
@@ -26,6 +27,22 @@ pub enum ImageState {
         w: u32,
         h: u32,
     },
+    /// An animated GIF/WebP. Terminals don't self-animate inline images in the
+    /// alternate screen (where a TUI lives), so we drive it ourselves: one
+    /// prebuilt protocol per frame, and the render/main loop advances `idx` on a
+    /// timer (see `App::advance_anims`). Produced for any graphics protocol.
+    Anim {
+        frames: Vec<StatefulProtocol>,
+        /// Per-frame display duration, parallel to `frames`.
+        delays: Vec<Duration>,
+        /// Index of the frame currently shown.
+        idx: usize,
+        /// When the current frame should give way to the next.
+        next_due: Instant,
+        /// Pixel dimensions, used to reserve the right row count (as for `Ready`).
+        w: u32,
+        h: u32,
+    },
     /// An unfurled link preview, optionally with an og:image thumbnail (the
     /// `image` field is the resolved image URL, fetched separately).
     Card {
@@ -39,6 +56,8 @@ pub enum ImageState {
 /// What a fetch resolved a URL to.
 pub enum Fetched {
     Image(StatefulProtocol, u32, u32),
+    /// An animated GIF/WebP: (per-frame protocols, per-frame delays, w, h).
+    Anim(Vec<StatefulProtocol>, Vec<Duration>, u32, u32),
     Card { title: String, desc: String, host: String, image: Option<String> },
     Nothing,
 }
@@ -84,6 +103,11 @@ impl Images {
     pub fn apply(&mut self, msg: ImageMsg) {
         let st = match msg.fetched {
             Fetched::Image(proto, w, h) => ImageState::Ready { proto, w, h },
+            Fetched::Anim(frames, delays, w, h) => {
+                let next_due =
+                    Instant::now() + delays.first().copied().unwrap_or(Duration::from_millis(100));
+                ImageState::Anim { frames, delays, idx: 0, next_due, w, h }
+            }
             Fetched::Card { title, desc, host, image } => {
                 ImageState::Card { title, desc, host, image }
             }
@@ -101,7 +125,10 @@ impl Images {
     pub fn graphics_active(&self) -> bool {
         use ratatui_image::picker::ProtocolType;
         !matches!(self.picker.protocol_type(), ProtocolType::Halfblocks)
-            && self.map.values().any(|s| matches!(s, ImageState::Ready { .. }))
+            && self
+                .map
+                .values()
+                .any(|s| matches!(s, ImageState::Ready { .. } | ImageState::Anim { .. }))
     }
 
     /// Number of terminal rows an image of pixel size `w`×`h` needs when drawn
@@ -151,6 +178,13 @@ async fn fetch_inner(http: &reqwest::Client, picker: &Picker, url: &str) -> Resu
             }
         }
         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        // On a graphics terminal, decode an animated GIF/WebP into frames we
+        // animate ourselves; everything else becomes a single static frame.
+        if is_graphics(picker)
+            && let Some((frames, delays, w, h)) = decode_animation(picker, bytes.to_vec()).await
+        {
+            return Ok(Fetched::Anim(frames, delays, w, h));
+        }
         let (proto, w, h) = decode_image(picker, bytes.to_vec()).await?;
         return Ok(Fetched::Image(proto, w, h));
     }
@@ -173,8 +207,8 @@ async fn fetch_inner(http: &reqwest::Client, picker: &Picker, url: &str) -> Resu
         if (!has_og_or_twitter && !has_title) || title_is_image_name {
             if let Some(src) = extract_first_img_src(&html) {
                 let img_url = resolve_url(url, &src);
-                if let Ok((proto, w, h)) = decode_image_url(http, picker, &img_url).await {
-                    return Ok(Fetched::Image(proto, w, h));
+                if let Ok(fetched) = decode_url_media(http, picker, &img_url).await {
+                    return Ok(fetched);
                 }
             }
         }
@@ -212,6 +246,11 @@ async fn fetch_inner(http: &reqwest::Client, picker: &Picker, url: &str) -> Resu
     let too_big = size.map_or(false, |s| s > MAX_IMAGE_BYTES);
     if ct_unknown && !too_big {
         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+        if is_graphics(picker)
+            && let Some((frames, delays, w, h)) = decode_animation(picker, bytes.to_vec()).await
+        {
+            return Ok(Fetched::Anim(frames, delays, w, h));
+        }
         if let Ok((proto, w, h)) = decode_image(picker, bytes.to_vec()).await {
             return Ok(Fetched::Image(proto, w, h));
         }
@@ -236,13 +275,108 @@ async fn decode_image(picker: &Picker, bytes: Vec<u8>) -> Result<(StatefulProtoc
     .map_err(|e| e.to_string())?
 }
 
-/// GET a URL and decode it as an image (used for og:image and image-wrapper
-/// `<img src>` resolution — these are separate from the original page fetch).
-async fn decode_image_url(
+/// Cap on how many frames we keep for an animation, to bound memory (each frame
+/// is a decoded image held in its own protocol).
+const MAX_ANIM_FRAMES: usize = 300;
+/// Downscale frames wider than this before building protocols, to bound memory.
+const MAX_ANIM_WIDTH: u32 = 480;
+
+fn is_graphics(picker: &Picker) -> bool {
+    !matches!(picker.protocol_type(), ratatui_image::picker::ProtocolType::Halfblocks)
+}
+
+/// Decode an animated GIF/WebP into one resize-protocol per frame plus per-frame
+/// delays and the pixel dimensions. Returns `None` for a still image (one frame
+/// or fewer) or anything that isn't an animated GIF/WebP, so the caller falls
+/// back to a single still frame. Runs on a blocking thread — decode is CPU-bound.
+async fn decode_animation(
+    picker: &Picker,
+    bytes: Vec<u8>,
+) -> Option<(Vec<StatefulProtocol>, Vec<Duration>, u32, u32)> {
+    let picker = *picker;
+    tokio::task::spawn_blocking(move || {
+        let frames = decode_frames(&bytes)?;
+        let (w, h) = frames[0].0.dimensions();
+        let mut protos = Vec::with_capacity(frames.len());
+        let mut delays = Vec::with_capacity(frames.len());
+        for (img, delay) in frames {
+            protos.push(picker.new_resize_protocol(image::DynamicImage::ImageRgba8(img)));
+            delays.push(delay);
+        }
+        Some((protos, delays, w, h))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Decode the frames of an animated GIF/WebP to RGBA buffers with their delays.
+/// `None` unless the input is an animated (multi-frame) GIF or WebP.
+fn decode_frames(bytes: &[u8]) -> Option<Vec<(image::RgbaImage, Duration)>> {
+    use image::AnimationDecoder;
+    use image::codecs::gif::GifDecoder;
+    use image::codecs::webp::WebPDecoder;
+
+    let is_gif = bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a");
+    let is_webp = bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP";
+    let raw: Vec<image::Frame> = if is_gif {
+        GifDecoder::new(std::io::Cursor::new(bytes))
+            .ok()?
+            .into_frames()
+            .take(MAX_ANIM_FRAMES)
+            .collect::<Result<_, _>>()
+            .ok()?
+    } else if is_webp {
+        WebPDecoder::new(std::io::Cursor::new(bytes))
+            .ok()?
+            .into_frames()
+            .take(MAX_ANIM_FRAMES)
+            .collect::<Result<_, _>>()
+            .ok()?
+    } else {
+        return None;
+    };
+    if raw.len() <= 1 {
+        return None; // a still GIF/WebP — let the normal path make one frame
+    }
+
+    let out = raw
+        .into_iter()
+        .map(|f| {
+            // Clamp: 0ms delays (common in GIFs) play far too fast; browsers use
+            // ~100ms. Floor the rest at 20ms so nothing pins the CPU.
+            let d = Duration::from(f.delay());
+            let delay = if d.is_zero() {
+                Duration::from_millis(100)
+            } else {
+                d.max(Duration::from_millis(20))
+            };
+            let mut img = f.into_buffer();
+            if img.width() > MAX_ANIM_WIDTH {
+                let nh = (img.height() * MAX_ANIM_WIDTH / img.width().max(1)).max(1);
+                img = image::imageops::resize(
+                    &img,
+                    MAX_ANIM_WIDTH,
+                    nh,
+                    image::imageops::FilterType::Triangle,
+                );
+            }
+            (img, delay)
+        })
+        .collect();
+    Some(out)
+}
+
+/// GET a URL and decode it as inline media — an animated GIF/WebP (on a graphics
+/// terminal) or a still image. Used to resolve the `<img src>` embedded in a
+/// paste/wrapper page, which is a separate fetch from the original page. This is
+/// where paste-hosted animations get their frames: the wrapper page is HTML, so
+/// only the embedded image URL reaches an image decoder.
+async fn decode_url_media(
     http: &reqwest::Client,
     picker: &Picker,
     url: &str,
-) -> Result<(StatefulProtocol, u32, u32), String> {
+) -> Result<Fetched, String> {
     let resp = http.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status().as_u16()));
@@ -253,7 +387,13 @@ async fn decode_image_url(
         }
     }
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    decode_image(picker, bytes.to_vec()).await
+    if is_graphics(picker)
+        && let Some((frames, delays, w, h)) = decode_animation(picker, bytes.to_vec()).await
+    {
+        return Ok(Fetched::Anim(frames, delays, w, h));
+    }
+    let (proto, w, h) = decode_image(picker, bytes.to_vec()).await?;
+    Ok(Fetched::Image(proto, w, h))
 }
 
 /// True if `title` contains an image-file extension followed by end-of-string
@@ -527,6 +667,53 @@ mod tests {
         assert_eq!(imgs.rows_for(200, 100, 40), 10);
         // Square image is capped at 20 rows.
         assert_eq!(imgs.rows_for(100, 100, 60), 20);
+    }
+
+    /// Encode an `n`-frame GIF of size `w`×`h` for the animation-detection tests.
+    fn make_gif(w: u32, h: u32, n: usize) -> Vec<u8> {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        use image::{Delay, Frame, RgbaImage};
+        let mut out = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut out);
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            for i in 0..n {
+                let px = if i % 2 == 0 { 255 } else { 0 };
+                let img = RgbaImage::from_pixel(w, h, image::Rgba([px, px, px, 255]));
+                let delay = Delay::from_numer_denom_ms(100, 1);
+                enc.encode_frame(Frame::from_parts(img, 0, 0, delay)).unwrap();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decode_frames_reads_animation_and_delays() {
+        // A multi-frame GIF decodes to that many frames, each with a nonzero,
+        // clamped delay and the right dimensions.
+        let frames = decode_frames(&make_gif(20, 10, 4)).expect("animated");
+        assert_eq!(frames.len(), 4);
+        for (img, delay) in &frames {
+            assert_eq!(img.dimensions(), (20, 10));
+            assert!(*delay >= std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn decode_frames_rejects_still_and_non_animation() {
+        // A single-frame GIF isn't animation — leave it to the still path.
+        assert!(decode_frames(&make_gif(8, 8, 1)).is_none());
+        // A PNG is not an animated GIF/WebP.
+        let png = {
+            use image::RgbaImage;
+            let img = RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]));
+            let mut buf = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+                .unwrap();
+            buf
+        };
+        assert!(decode_frames(&png).is_none());
     }
 }
 

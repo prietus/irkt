@@ -163,6 +163,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     // Drop last frame's click targets; they're repopulated below unless an
     // early return leaves the chat empty.
     app.chat_rows.clear();
+    // Likewise last frame's visible-animation list; repopulated as we draw.
+    app.visible_anims.clear();
     // Topic / header row + messages.
     let parts = Layout::default()
         .direction(Direction::Vertical)
@@ -351,12 +353,22 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         let indent = IMAGE_INDENT.min(body.width.saturating_sub(1));
         let w = cols.min(body.width.saturating_sub(indent));
         let rect = Rect { x: body.x + indent, y, width: w, height };
-        if let Some(ImageState::Ready { proto, .. }) = app.images.map.get_mut(&url) {
-            f.render_stateful_widget(
-                StatefulImage::default().resize(Resize::Fit(None)),
-                rect,
-                proto,
-            );
+        // Animated images render like stills but through the current frame's
+        // protocol; note them as visible so the frame clock advances/redraws them.
+        if matches!(app.images.map.get(&url), Some(ImageState::Anim { .. })) {
+            app.visible_anims.push(url.clone());
+        }
+        let widget = StatefulImage::default().resize(Resize::Fit(None));
+        match app.images.map.get_mut(&url) {
+            Some(ImageState::Ready { proto, .. }) => {
+                f.render_stateful_widget(widget, rect, proto);
+            }
+            Some(ImageState::Anim { frames, idx, .. }) => {
+                if let Some(proto) = frames.get_mut(*idx) {
+                    f.render_stateful_widget(widget, rect, proto);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -428,7 +440,9 @@ fn push_message(
     if (ctx.inline || ctx.unfurl) && matches!(line.kind, LineKind::Message | LineKind::Self_) {
         for url in extract_urls(&line.text) {
             match ctx.images.map.get(&url) {
-                Some(ImageState::Ready { w, h, .. }) if ctx.inline => {
+                Some(ImageState::Ready { w, h, .. } | ImageState::Anim { w, h, .. })
+                    if ctx.inline =>
+                {
                     let r = ctx.images.rows_for(*w, *h, ctx.img_cols);
                     let s = rows.len();
                     for _ in 0..r {

@@ -710,6 +710,38 @@ impl App {
         });
     }
 
+    /// When the soonest-due visible animation frame should be shown, if any
+    /// animated image is currently on screen. The main loop waits until then (or
+    /// the next event, whichever comes first) so animations advance on their own.
+    pub fn next_anim_due(&self) -> Option<std::time::Instant> {
+        self.visible_anims
+            .iter()
+            .filter_map(|url| match self.images.map.get(url) {
+                Some(crate::images::ImageState::Anim { next_due, .. }) => Some(*next_due),
+                _ => None,
+            })
+            .min()
+    }
+
+    /// Advance every visible animation whose current frame is due, wrapping at the
+    /// end of the loop. Returns true if any frame changed, so the caller redraws.
+    pub fn advance_anims(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let mut changed = false;
+        for url in &self.visible_anims {
+            if let Some(crate::images::ImageState::Anim { frames, delays, idx, next_due, .. }) =
+                self.images.map.get_mut(url)
+                && now >= *next_due
+                && !frames.is_empty()
+            {
+                *idx = (*idx + 1) % frames.len();
+                *next_due = now + delays[*idx];
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Drop typing indicators whose last `+typing=active` is older than the
     /// spec's window. A sender refreshes `active` every 3s while typing, so 6s
     /// without a refresh means they stopped (or the `done`/peer was lost) and

@@ -253,7 +253,27 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
     term.draw(|f| ui::draw(f, &mut app))?;
     let mut view = view_key(&app);
 
-    while let Some(first) = tick_rx.recv().await {
+    loop {
+        // Wait for the next event; but if an animated image is on screen, wake
+        // no later than its next frame is due, so animations keep playing with
+        // no input. `None` from this means the frame deadline fired with no event.
+        let first = match app.next_anim_due() {
+            Some(due) => match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(due),
+                tick_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(t)) => Some(t),
+                Ok(None) => break, // all senders dropped
+                Err(_) => None,    // animation frame due, no event
+            },
+            None => match tick_rx.recv().await {
+                Some(t) => Some(t),
+                None => break,
+            },
+        };
+
         // Drain the just-received tick *plus* everything already queued and
         // redraw only once for the whole batch. A redraw of the full TUI is
         // far more expensive than applying an event, so redrawing per-event
@@ -267,7 +287,7 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         // A bare heartbeat (Tock) only forces a redraw when it actually reaps
         // something; every other tick changes visible state, so redraw.
         let mut need_redraw = false;
-        let mut batch = Some(first);
+        let mut batch = first;
         // Cap so a sustained flood can't starve the screen of redraws forever.
         let mut budget = 1024u32;
         while let Some(tick) = batch.take() {
@@ -315,6 +335,11 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         }
         if app.should_quit {
             break;
+        }
+        // Advance any animation frames now due — both when the wake *was* the
+        // frame deadline and when frames came due while a batch was processing.
+        if app.advance_anims() {
+            need_redraw = true;
         }
         if !need_redraw {
             continue;

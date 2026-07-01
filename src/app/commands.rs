@@ -372,6 +372,29 @@ impl App {
             }
             "ignore" => self.cmd_nick_list(NickList::Ignore, rest),
             "dim" => self.cmd_nick_list(NickList::Dim, rest),
+            "imgdbg" => {
+                use crate::images::ImageState;
+                let pt = self.images.picker.protocol_type();
+                let fs = self.images.picker.font_size();
+                let (mut ready, mut anim, mut pending, mut none, mut card, mut frames) =
+                    (0, 0, 0, 0, 0, 0);
+                for st in self.images.map.values() {
+                    match st {
+                        ImageState::Ready { .. } => ready += 1,
+                        ImageState::Anim { frames: f, .. } => {
+                            anim += 1;
+                            frames = f.len();
+                        }
+                        ImageState::Pending => pending += 1,
+                        ImageState::None => none += 1,
+                        ImageState::Card { .. } => card += 1,
+                    }
+                }
+                self.set_status(format!(
+                    "proto={pt:?} fs={fs:?} | anim={anim}({frames}f) ready={ready} pending={pending} card={card} none={none} vis={}",
+                    self.visible_anims.len()
+                ));
+            }
             "react" => {
                 if rest.is_empty() {
                     self.set_status("usage: /react <emoji> — reacts to the selected/last message");

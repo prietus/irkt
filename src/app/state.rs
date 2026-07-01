@@ -376,6 +376,10 @@ pub struct App {
     pub member_rows: Vec<(u16, String)>,
     /// Horizontal extent `(x_start, x_end)` of the member panel's clickable area.
     pub member_x: (u16, u16),
+    /// URLs of animated images drawn in the last chat frame (i.e. currently
+    /// visible), so the frame clock advances and redraws only those. Rebuilt
+    /// every frame.
+    pub visible_anims: Vec<String>,
 }
 
 pub struct Completion {
@@ -429,6 +433,7 @@ impl App {
             chat_x: (0, 0),
             member_rows: Vec::new(),
             member_x: (0, 0),
+            visible_anims: Vec::new(),
         }
     }
 
