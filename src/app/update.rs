@@ -113,6 +113,15 @@ impl App {
             }
             Event::Disconnected => {
                 self.networks[ni].conn = ConnState::Disconnected;
+                if std::env::var_os("IRKT_NAMESDBG").is_some() {
+                    crate::irc::worker::diag_log(
+                        &self.networks[ni].cfg.name,
+                        "DISCONNECT — clearing all rosters",
+                    );
+                }
+                // Membership is unknown while offline; clear it so the fresh NAMES
+                // after reconnect rebuilds it instead of stacking on a stale roster.
+                self.networks[ni].members.clear();
                 self.networks[ni].status_mut().push(Line::system("disconnected"));
             }
             Event::Reconnecting { in_secs } => {
@@ -149,20 +158,43 @@ impl App {
                     .push(Line::system(format!("CTCP {query} reply from {from}: {args}")));
             }
             Event::UserJoined { channel, nick, .. } => {
+                let dbg = std::env::var_os("IRKT_NAMESDBG").is_some();
                 let net = &mut self.networks[ni];
+                let net_name = net.cfg.name.clone();
                 let key = channel.to_lowercase();
                 let bi = net.ensure_buffer(&channel, BufferKind::Channel);
-                net.members.entry(key).or_default().push(crate::irc::MemberEntry {
-                    nick: nick.clone(),
-                    prefixes: String::new(),
-                    userhost: None,
-                });
+                let is_self = nick.eq_ignore_ascii_case(&net.nick);
+                let roster = net.members.entry(key).or_default();
+                // Our own (re)join means a fresh NAMES is on its way; drop any
+                // stale roster so a reconnect or bouncer re-attach can't leave us
+                // (or anyone else) listed twice.
+                if is_self {
+                    roster.clear();
+                }
+                // Never double-list: a netjoin replay or a JOIN that races NAMES
+                // can repeat someone already present.
+                if !roster.iter().any(|e| e.nick.eq_ignore_ascii_case(&nick)) {
+                    roster.push(crate::irc::MemberEntry {
+                        nick: nick.clone(),
+                        prefixes: String::new(),
+                        userhost: None,
+                    });
+                }
+                if dbg {
+                    crate::irc::worker::diag_log(
+                        &net_name,
+                        &format!(
+                            "JOIN self={is_self} nick={nick} chan={channel} roster_now={}",
+                            roster.len(),
+                        ),
+                    );
+                }
                 // Our own join (including bouncer reconnect): pull recent backlog.
-                if nick.eq_ignore_ascii_case(&net.nick) {
+                if is_self {
                     self.request_latest_history(ni, bi);
                 }
                 let net = &mut self.networks[ni];
-                if nick != net.nick {
+                if !is_self {
                     let line = Line {
                         time: String::new(),
                         kind: LineKind::Join,
@@ -258,9 +290,33 @@ impl App {
                 }
             }
             Event::Names { channel, members } => {
+                let dbg = std::env::var_os("IRKT_NAMESDBG").is_some();
                 let net = &mut self.networks[ni];
+                let net_name = net.cfg.name.clone();
                 net.ensure_buffer(&channel, BufferKind::Channel);
-                net.members.insert(channel.to_lowercase(), members);
+                // NAMES arrives split across many 353 lines, each its own event, so
+                // append and dedup rather than replace — otherwise only the last
+                // slice would survive. NAMES is authoritative for prefixes, so it
+                // upgrades the blank prefix a live JOIN left behind.
+                let roster = net.members.entry(channel.to_lowercase()).or_default();
+                for m in members {
+                    if let Some(existing) =
+                        roster.iter_mut().find(|e| e.nick.eq_ignore_ascii_case(&m.nick))
+                    {
+                        existing.prefixes = m.prefixes;
+                        if m.userhost.is_some() {
+                            existing.userhost = m.userhost;
+                        }
+                    } else {
+                        roster.push(m);
+                    }
+                }
+                if dbg {
+                    crate::irc::worker::diag_log(
+                        &net_name,
+                        &format!("APPLY Names chan={channel} roster_now={}", roster.len()),
+                    );
+                }
             }
             Event::Topic { channel, topic } => {
                 let net = &mut self.networks[ni];
@@ -818,6 +874,79 @@ mod tests {
         let net = &app.networks[0];
         assert!(net.find_buffer("#rust").is_some(), "channel buffer should exist");
         assert!(net.members.get("#rust").map(|m| m.len()).unwrap_or(0) >= 1);
+    }
+
+    fn names(channel: &str, nicks: &[&str]) -> Event {
+        Event::Names {
+            channel: channel.into(),
+            members: nicks
+                .iter()
+                .map(|n| crate::irc::MemberEntry {
+                    nick: (*n).to_string(),
+                    prefixes: String::new(),
+                    userhost: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn joins(app: &mut App, channel: &str, nick: &str) {
+        app.apply_event(0, Event::UserJoined {
+            channel: channel.into(),
+            nick: nick.into(),
+            userhost: None,
+            account: None,
+            realname: None,
+            meta: meta(),
+        });
+    }
+
+    // A big channel's NAMES arrives across many 353 lines, each its own event;
+    // the roster must accumulate them rather than keep only the last slice.
+    #[test]
+    fn names_accumulate_across_multiple_353_events() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me"); // our own join opens the buffer
+        app.apply_event(0, names("#c", &["me", "a", "b"]));
+        app.apply_event(0, names("#c", &["c", "d", "e"]));
+        let roster = &app.networks[0].members["#c"];
+        assert_eq!(roster.len(), 6, "both 353 slices plus us are kept");
+        for n in ["me", "a", "b", "c", "d", "e"] {
+            assert!(roster.iter().any(|m| m.nick == n), "{n} present");
+        }
+    }
+
+    // NAMES repeating a nick, or a JOIN racing NAMES, must not double-list anyone.
+    #[test]
+    fn roster_never_double_lists_a_nick() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me");
+        app.apply_event(0, names("#c", &["alice", "bob"]));
+        app.apply_event(0, names("#c", &["alice"])); // duplicate slice
+        joins(&mut app, "#c", "bob"); // JOIN that races the roster
+        let roster = &app.networks[0].members["#c"];
+        assert_eq!(roster.iter().filter(|m| m.nick == "alice").count(), 1);
+        assert_eq!(roster.iter().filter(|m| m.nick == "bob").count(), 1);
+    }
+
+    // A reconnect (or bouncer re-attach) must not leave a stale, doubled roster:
+    // disconnect clears it and our own re-JOIN starts it fresh for the new NAMES.
+    #[test]
+    fn reconnect_rebuilds_roster_without_duplicates() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me");
+        app.apply_event(0, names("#c", &["me", "alice", "bob"]));
+        assert_eq!(app.networks[0].members["#c"].len(), 3);
+
+        app.apply_event(0, Event::Disconnected);
+        assert!(app.networks[0].members.get("#c").map(|m| m.is_empty()).unwrap_or(true));
+
+        // Reconnect: we rejoin and the server resends NAMES.
+        joins(&mut app, "#c", "me");
+        app.apply_event(0, names("#c", &["me", "alice", "bob"]));
+        let roster = &app.networks[0].members["#c"];
+        assert_eq!(roster.len(), 3, "roster rebuilt cleanly, nobody doubled");
+        assert_eq!(roster.iter().filter(|m| m.nick == "me").count(), 1);
     }
 
     fn hist_meta(iso: &str, msgid: &str) -> MsgMeta {

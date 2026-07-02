@@ -50,7 +50,7 @@ const WANT_EXTRA_CAPS: &[&str] = &[
 /// time. A temporary diagnostic to capture *why* the connection drops — every
 /// connect/disconnect funnels through here so the exact reason and cadence are
 /// on disk to read back later.
-fn diag_log(net: &str, msg: &str) {
+pub(crate) fn diag_log(net: &str, msg: &str) {
     let Some(dir) = crate::config::config_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
     else {
         return;
@@ -223,14 +223,20 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
             let mut cap_state = CapState::default();
             let mut batches: HashMap<String, BatchInfo> = HashMap::new();
             let mut isupport = ISupport::default();
-            // Accumulate multi-line NAMES (353) replies per channel until the
-            // closing 366; big channels split the list across many 353 lines.
-            let mut names_acc: HashMap<String, Vec<MemberEntry>> = HashMap::new();
 
             loop {
                 tokio::select! {
                     incoming = stream.next() => match incoming {
                         Some(Ok(msg)) => {
+                            if std::env::var_os("IRKT_NAMESDBG").is_some()
+                                && let Command::Response(ref code, ref a) = msg.command
+                                && matches!(code, Response::RPL_NAMREPLY | Response::RPL_ENDOFNAMES)
+                            {
+                                diag_log(&cfg.name, &format!(
+                                    "RECV {code:?} phase={auth_phase:?} args.len={} args={a:?}",
+                                    a.len(),
+                                ));
+                            }
                             if auth_phase == AuthPhase::Done {
                                 if let Some(updated) = handle_cap_notify(&msg, &sender, &mut cap_state) {
                                     let _ = out.send(Event::CapsAcked(updated)).await;
@@ -307,7 +313,14 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                             if accumulate_multiline_chunk(&msg, &mut batches) {
                                 continue;
                             }
-                            for ev in translate(msg, &batches, &mut isupport, &mut names_acc) {
+                            for ev in translate(msg, &batches, &mut isupport) {
+                                if std::env::var_os("IRKT_NAMESDBG").is_some()
+                                    && let Event::Names { channel, members } = &ev
+                                {
+                                    diag_log(&cfg.name, &format!(
+                                        "EMIT Names chan={channel} members={}", members.len(),
+                                    ));
+                                }
                                 if out.send(ev).await.is_err() { return; }
                             }
                         }
@@ -910,7 +923,6 @@ fn translate(
     msg: Message,
     batches: &HashMap<String, BatchInfo>,
     isupport: &mut ISupport,
-    names_acc: &mut HashMap<String, Vec<MemberEntry>>,
 ) -> Vec<Event> {
     let (nick, sender_userhost) = match &msg.prefix {
         Some(Prefix::Nickname(n, ident, host)) => {
@@ -1002,20 +1014,18 @@ fn translate(
                 if changed { vec![Event::ISupport(isupport.clone())] } else { vec![] }
             }
             Response::RPL_NAMREPLY if args.len() >= 4 => {
-                // Accumulate; a large channel's NAMES is split across many 353
-                // lines. The list is emitted once at RPL_ENDOFNAMES (366).
+                // Emit each 353 line's slice immediately; the UI appends them into
+                // the channel roster. A big channel splits NAMES across many 353
+                // lines, so deferring to the closing 366 would lose the whole
+                // roster if that 366 ever failed to arrive or line up.
                 let channel = args[2].clone();
-                names_acc
-                    .entry(channel)
-                    .or_default()
-                    .extend(args[3].split_whitespace().filter_map(parse_name_entry));
-                vec![]
-            }
-            Response::RPL_ENDOFNAMES if args.len() >= 2 => {
-                let channel = args[1].clone();
-                let members = names_acc.remove(&channel).unwrap_or_default();
+                let members = args[3].split_whitespace().filter_map(parse_name_entry).collect();
                 vec![Event::Names { channel, members }]
             }
+            // The roster is built incrementally from the 353 lines above, so the
+            // closing 366 is just a terminator we swallow to keep it off the status
+            // buffer.
+            Response::RPL_ENDOFNAMES => vec![],
             Response::RPL_TOPIC if args.len() >= 3 => {
                 vec![Event::Topic { channel: args[1].clone(), topic: strip_irc_formatting(&args[2]) }]
             }
@@ -1434,27 +1444,33 @@ mod tests {
     }
 
     #[test]
-    fn names_accumulate_across_353_lines_until_366() {
+    fn each_353_line_emits_its_own_names_slice() {
         let batches = HashMap::new();
         let mut isupport = ISupport::default();
-        let mut acc: HashMap<String, Vec<MemberEntry>> = HashMap::new();
 
-        // Each 353 emits nothing; the list builds up in the accumulator.
-        assert!(translate(namreply("#c", "@alice bob carol"), &batches, &mut isupport, &mut acc).is_empty());
-        assert!(translate(namreply("#c", "dave +erin"), &batches, &mut isupport, &mut acc).is_empty());
-
-        // The 366 emits the full, combined member list.
-        let evs = translate(endofnames("#c"), &batches, &mut isupport, &mut acc);
+        // Every 353 line yields a Names event with that line's members; the UI
+        // appends them so a big channel split across many lines is never lost.
+        let evs = translate(namreply("#c", "@alice bob carol"), &batches, &mut isupport);
         match evs.as_slice() {
             [Event::Names { channel, members }] => {
                 assert_eq!(channel, "#c");
-                assert_eq!(members.len(), 5, "all members across both 353 lines");
+                assert_eq!(members.len(), 3);
                 assert!(members.iter().any(|m| m.nick == "alice" && m.prefixes == "@"));
+                assert!(members.iter().any(|m| m.nick == "carol"));
+            }
+            _ => panic!("expected a Names event for the 353 line"),
+        }
+
+        let evs = translate(namreply("#c", "dave +erin"), &batches, &mut isupport);
+        match evs.as_slice() {
+            [Event::Names { members, .. }] => {
+                assert_eq!(members.len(), 2);
                 assert!(members.iter().any(|m| m.nick == "erin" && m.prefixes == "+"));
             }
-            _ => panic!("expected exactly one Names event at end of NAMES"),
+            _ => panic!("expected a Names event for the second 353 line"),
         }
-        // Accumulator is cleared so a re-query starts fresh.
-        assert!(acc.is_empty());
+
+        // The closing 366 is swallowed (no status-buffer noise).
+        assert!(translate(endofnames("#c"), &batches, &mut isupport).is_empty());
     }
 }
