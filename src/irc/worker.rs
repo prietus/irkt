@@ -47,10 +47,9 @@ const WANT_EXTRA_CAPS: &[&str] = &[
 ];
 
 /// Append a line to `irkt.log` next to `config.toml`, timestamped in local
-/// time. A temporary diagnostic to capture *why* the connection drops — every
-/// connect/disconnect funnels through here so the exact reason and cadence are
-/// on disk to read back later.
-pub(crate) fn diag_log(net: &str, msg: &str) {
+/// time. Every connect/disconnect funnels through here so the exact reason and
+/// cadence of connection drops are on disk to read back later.
+fn diag_log(net: &str, msg: &str) {
     let Some(dir) = crate::config::config_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
     else {
         return;
@@ -228,15 +227,6 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                 tokio::select! {
                     incoming = stream.next() => match incoming {
                         Some(Ok(msg)) => {
-                            if std::env::var_os("IRKT_NAMESDBG").is_some()
-                                && let Command::Response(ref code, ref a) = msg.command
-                                && matches!(code, Response::RPL_NAMREPLY | Response::RPL_ENDOFNAMES)
-                            {
-                                diag_log(&cfg.name, &format!(
-                                    "RECV {code:?} phase={auth_phase:?} args.len={} args={a:?}",
-                                    a.len(),
-                                ));
-                            }
                             if auth_phase == AuthPhase::Done {
                                 if let Some(updated) = handle_cap_notify(&msg, &sender, &mut cap_state) {
                                     let _ = out.send(Event::CapsAcked(updated)).await;
@@ -314,13 +304,6 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                                 continue;
                             }
                             for ev in translate(msg, &batches, &mut isupport) {
-                                if std::env::var_os("IRKT_NAMESDBG").is_some()
-                                    && let Event::Names { channel, members } = &ev
-                                {
-                                    diag_log(&cfg.name, &format!(
-                                        "EMIT Names chan={channel} members={}", members.len(),
-                                    ));
-                                }
                                 if out.send(ev).await.is_err() { return; }
                             }
                         }

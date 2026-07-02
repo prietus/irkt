@@ -10,6 +10,14 @@ const NICK_ACTIVITY_WINDOW: usize = 200;
 /// How many messages to request per CHATHISTORY page (LATEST and BEFORE).
 const HISTORY_LIMIT: u32 = 50;
 
+/// True when an event arrived inside a chathistory batch — i.e. it is replayed
+/// history (draft/chathistory + draft/event-playback), not a live event. Such
+/// JOIN/PART/QUIT events are stale membership churn and must not mutate the live
+/// roster; only real-time presence and the NAMES burst are authoritative.
+fn is_playback(meta: &MsgMeta) -> bool {
+    meta.batch_kind.as_deref() == Some("chathistory")
+}
+
 impl App {
     /// True if `body` mentions us or a highlight keyword (case-insensitive,
     /// rough word-boundary match).
@@ -113,12 +121,6 @@ impl App {
             }
             Event::Disconnected => {
                 self.networks[ni].conn = ConnState::Disconnected;
-                if std::env::var_os("IRKT_NAMESDBG").is_some() {
-                    crate::irc::worker::diag_log(
-                        &self.networks[ni].cfg.name,
-                        "DISCONNECT — clearing all rosters",
-                    );
-                }
                 // Membership is unknown while offline; clear it so the fresh NAMES
                 // after reconnect rebuilds it instead of stacking on a stale roster.
                 self.networks[ni].members.clear();
@@ -157,20 +159,22 @@ impl App {
                     .status_mut()
                     .push(Line::system(format!("CTCP {query} reply from {from}: {args}")));
             }
-            Event::UserJoined { channel, nick, .. } => {
-                let dbg = std::env::var_os("IRKT_NAMESDBG").is_some();
+            Event::UserJoined { channel, nick, meta, .. } => {
+                // History playback (draft/event-playback inside a chathistory
+                // batch) replays old JOIN/PART churn — including our own past
+                // (re)joins, going back days. It is not live state: applying it
+                // would corrupt the roster that NAMES authoritatively builds (a
+                // replayed self-JOIN/PART could wipe every member down to us).
+                // Drop it — the live roster stands and messages still render via
+                // Event::Privmsg.
+                if is_playback(&meta) {
+                    return;
+                }
                 let net = &mut self.networks[ni];
-                let net_name = net.cfg.name.clone();
                 let key = channel.to_lowercase();
                 let bi = net.ensure_buffer(&channel, BufferKind::Channel);
                 let is_self = nick.eq_ignore_ascii_case(&net.nick);
                 let roster = net.members.entry(key).or_default();
-                // Our own (re)join means a fresh NAMES is on its way; drop any
-                // stale roster so a reconnect or bouncer re-attach can't leave us
-                // (or anyone else) listed twice.
-                if is_self {
-                    roster.clear();
-                }
                 // Never double-list: a netjoin replay or a JOIN that races NAMES
                 // can repeat someone already present.
                 if !roster.iter().any(|e| e.nick.eq_ignore_ascii_case(&nick)) {
@@ -179,15 +183,6 @@ impl App {
                         prefixes: String::new(),
                         userhost: None,
                     });
-                }
-                if dbg {
-                    crate::irc::worker::diag_log(
-                        &net_name,
-                        &format!(
-                            "JOIN self={is_self} nick={nick} chan={channel} roster_now={}",
-                            roster.len(),
-                        ),
-                    );
                 }
                 // Our own join (including bouncer reconnect): pull recent backlog.
                 if is_self {
@@ -207,11 +202,23 @@ impl App {
                     net.buffers[bi].push(line);
                 }
             }
-            Event::UserLeft { channel, nick, .. } => {
+            Event::UserLeft { channel, nick, meta } => {
+                // Skip replayed history churn (see UserJoined).
+                if is_playback(&meta) {
+                    return;
+                }
                 let net = &mut self.networks[ni];
                 let key = channel.to_lowercase();
+                let is_self = nick.eq_ignore_ascii_case(&net.nick);
                 if let Some(m) = net.members.get_mut(&key) {
-                    m.retain(|e| !e.nick.eq_ignore_ascii_case(&nick));
+                    if is_self {
+                        // We really left (this is live, not playback): the whole
+                        // roster is stale, so drop it and let a later rejoin
+                        // rebuild cleanly from a fresh NAMES.
+                        m.clear();
+                    } else {
+                        m.retain(|e| !e.nick.eq_ignore_ascii_case(&nick));
+                    }
                 }
                 if let Some(bi) = net.find_buffer(&channel) {
                     net.buffers[bi].push(Line {
@@ -225,7 +232,11 @@ impl App {
                     });
                 }
             }
-            Event::UserQuit { nick, reason, .. } => {
+            Event::UserQuit { nick, reason, meta } => {
+                // Skip replayed history churn (see UserJoined).
+                if is_playback(&meta) {
+                    return;
+                }
                 let net = &mut self.networks[ni];
                 let text = match &reason {
                     Some(r) => format!("{nick} quit ({r})"),
@@ -290,9 +301,7 @@ impl App {
                 }
             }
             Event::Names { channel, members } => {
-                let dbg = std::env::var_os("IRKT_NAMESDBG").is_some();
                 let net = &mut self.networks[ni];
-                let net_name = net.cfg.name.clone();
                 net.ensure_buffer(&channel, BufferKind::Channel);
                 // NAMES arrives split across many 353 lines, each its own event, so
                 // append and dedup rather than replace — otherwise only the last
@@ -310,12 +319,6 @@ impl App {
                     } else {
                         roster.push(m);
                     }
-                }
-                if dbg {
-                    crate::irc::worker::diag_log(
-                        &net_name,
-                        &format!("APPLY Names chan={channel} roster_now={}", roster.len()),
-                    );
                 }
             }
             Event::Topic { channel, topic } => {
@@ -947,6 +950,74 @@ mod tests {
         let roster = &app.networks[0].members["#c"];
         assert_eq!(roster.len(), 3, "roster rebuilt cleanly, nobody doubled");
         assert_eq!(roster.iter().filter(|m| m.nick == "me").count(), 1);
+    }
+
+    // Meta for a JOIN/PART/QUIT replayed inside a chathistory batch (bouncer
+    // event-playback) — the exact shape that corrupted the roster.
+    fn playback_meta() -> MsgMeta {
+        hist_meta("2026-07-01T20:00:00Z", "pb")
+    }
+
+    fn pb_join(app: &mut App, channel: &str, nick: &str) {
+        app.apply_event(0, Event::UserJoined {
+            channel: channel.into(),
+            nick: nick.into(),
+            userhost: None,
+            account: None,
+            realname: None,
+            meta: playback_meta(),
+        });
+    }
+
+    fn pb_part(app: &mut App, channel: &str, nick: &str) {
+        app.apply_event(0, Event::UserLeft {
+            channel: channel.into(),
+            nick: nick.into(),
+            meta: playback_meta(),
+        });
+    }
+
+    // A bouncer replays our historical JOIN/PART churn via event-playback, long
+    // after the live NAMES filled the roster. Those replayed events must not
+    // touch the roster — the 13-vs-1400 / "only me" bug.
+    #[test]
+    fn playback_join_part_never_mutates_live_roster() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me"); // real join
+        app.apply_event(0, names("#c", &["me", "alice", "bob", "carol", "dave"]));
+        assert_eq!(app.networks[0].members["#c"].len(), 5);
+
+        // The whole replayed history burst: our own join, our own part (this is
+        // what used to wipe it to 0/1), plus a present member's part.
+        pb_join(&mut app, "#c", "me");
+        pb_part(&mut app, "#c", "me");
+        pb_join(&mut app, "#c", "me");
+        pb_part(&mut app, "#c", "alice"); // alice is really here — must not vanish
+
+        let roster = &app.networks[0].members["#c"];
+        assert_eq!(roster.len(), 5, "playback must leave the live roster untouched");
+        assert!(roster.iter().any(|m| m.nick == "alice"), "present member kept");
+        assert_eq!(roster.iter().filter(|m| m.nick == "me").count(), 1);
+    }
+
+    // A *live* self-PART (not playback) drops the roster, so a later rejoin
+    // rebuilds from a fresh NAMES instead of stacking ghosts.
+    #[test]
+    fn live_self_part_clears_roster() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me");
+        app.apply_event(0, names("#c", &["me", "alice", "bob"]));
+        assert_eq!(app.networks[0].members["#c"].len(), 3);
+
+        app.apply_event(0, Event::UserLeft {
+            channel: "#c".into(),
+            nick: "me".into(),
+            meta: meta(), // batch_kind None → live
+        });
+        assert!(
+            app.networks[0].members["#c"].is_empty(),
+            "our own live PART clears the whole roster"
+        );
     }
 
     fn hist_meta(iso: &str, msgid: &str) -> MsgMeta {
