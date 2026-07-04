@@ -92,6 +92,20 @@ impl App {
                     }
                 }
             }
+            "cycle" | "hop" | "rejoin" => {
+                // Part then immediately re-join the active channel, keeping its
+                // buffer open. The real self-PART clears the roster; the JOIN's
+                // fresh NAMES burst rebuilds it.
+                let Some(chan) = self.active_channel() else {
+                    self.set_status("not in a channel");
+                    return;
+                };
+                let _ = self.networks[ni].out.try_send(Outgoing::Part {
+                    channel: chan.clone(),
+                    reason: None,
+                });
+                let _ = self.networks[ni].out.try_send(Outgoing::Join(chan));
+            }
             "msg" | "m" => {
                 let Some((target, text)) = rest.split_once(char::is_whitespace) else {
                     self.set_status("usage: /msg <target> <text>");
@@ -114,6 +128,44 @@ impl App {
                     self.networks[ni].buffers[bi].push(Line {
                         time: String::new(),
                         kind: LineKind::Self_,
+                        from: nick,
+                        text,
+                        msgid: None,
+                        highlight: false,
+                        reply_to: None,
+                    });
+                }
+            }
+            "notice" => {
+                let Some((target, text)) = rest.split_once(char::is_whitespace) else {
+                    self.set_status("usage: /notice <target> <text>");
+                    return;
+                };
+                let target = target.to_string();
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    self.set_status("usage: /notice <target> <text>");
+                    return;
+                }
+                // NOTICE is a distinct message type from PRIVMSG (used by bots and
+                // services); the crate's stringify prefixes the trailing param with
+                // ':' so a multi-word text is sent as one parameter.
+                let _ = self.networks[ni].out.try_send(Outgoing::Raw {
+                    cmd: "NOTICE".into(),
+                    args: vec![target.clone(), text.clone()],
+                });
+                // Echo locally unless the server will bounce it back via echo-message.
+                if !self.networks[ni].caps.iter().any(|c| c == "echo-message") {
+                    let kind = if self.networks[ni].is_channel(&target) {
+                        BufferKind::Channel
+                    } else {
+                        BufferKind::Query
+                    };
+                    let bi = self.networks[ni].ensure_buffer(&target, kind);
+                    let nick = self.networks[ni].nick.clone();
+                    self.networks[ni].buffers[bi].push(Line {
+                        time: String::new(),
+                        kind: LineKind::Notice,
                         from: nick,
                         text,
                         msgid: None,
@@ -179,9 +231,56 @@ impl App {
                     .out
                     .try_send(Outgoing::Whois(rest.split_whitespace().next().unwrap().to_string()));
             }
+            "whowas" => {
+                if rest.is_empty() {
+                    self.set_status("usage: /whowas <nick>");
+                    return;
+                }
+                let _ = self.networks[ni].out.try_send(Outgoing::Raw {
+                    cmd: "WHOWAS".into(),
+                    args: vec![rest.split_whitespace().next().unwrap().to_string()],
+                });
+            }
+            "ctcp" => {
+                let Some((target, rest2)) = rest.split_once(char::is_whitespace) else {
+                    self.set_status("usage: /ctcp <target> <VERSION|PING|TIME|CLIENTINFO|...>");
+                    return;
+                };
+                let rest2 = rest2.trim();
+                if rest2.is_empty() {
+                    self.set_status("usage: /ctcp <target> <VERSION|PING|TIME|CLIENTINFO|...>");
+                    return;
+                }
+                // Uppercase only the CTCP verb; leave any argument (e.g. `PING <token>`) intact.
+                let query = match rest2.split_once(char::is_whitespace) {
+                    Some((verb, arg)) => format!("{} {arg}", verb.to_uppercase()),
+                    None => rest2.to_uppercase(),
+                };
+                let _ = self.networks[ni].out.try_send(Outgoing::Ctcp {
+                    target: target.to_string(),
+                    query,
+                });
+                self.set_status(format!("CTCP → {target}"));
+            }
+            // Services shortcuts: thin PRIVMSG wrappers. `/identify` prefixes the
+            // NickServ IDENTIFY verb for you. Status is kept body-free so passwords
+            // never surface in the statusbar.
+            "ns" | "nickserv" => self.cmd_service(ni, "NickServ", rest),
+            "cs" | "chanserv" => self.cmd_service(ni, "ChanServ", rest),
+            "ms" | "memoserv" => self.cmd_service(ni, "MemoServ", rest),
+            "identify" | "id" => {
+                if rest.is_empty() {
+                    self.set_status("usage: /identify [account] <password>");
+                    return;
+                }
+                self.cmd_service(ni, "NickServ", &format!("IDENTIFY {rest}"));
+            }
             "away" => {
                 let msg = if rest.is_empty() { None } else { Some(rest.to_string()) };
                 let _ = self.networks[ni].out.try_send(Outgoing::Away(msg));
+            }
+            "back" => {
+                let _ = self.networks[ni].out.try_send(Outgoing::Away(None));
             }
             "mode" => {
                 let mut parts = rest.split_whitespace();
@@ -280,6 +379,24 @@ impl App {
                 }
                 self.networks[ni].buffers.remove(bi);
                 self.clamp_active();
+            }
+            "clear" | "clr" => {
+                // Wipe the current buffer's scrollback (view only — does not part
+                // the channel or touch membership). Re-pins to the bottom.
+                let buf = &mut self.networks[ni].buffers[self.active.buf];
+                buf.lines.clear();
+                buf.scroll = 0;
+                self.set_status("buffer cleared");
+            }
+            "clearall" => {
+                // Wipe the scrollback of every buffer on every network (view only).
+                for net in &mut self.networks {
+                    for buf in &mut net.buffers {
+                        buf.lines.clear();
+                        buf.scroll = 0;
+                    }
+                }
+                self.set_status("all buffers cleared");
             }
             "server" | "net" => {
                 if rest.is_empty() {
@@ -453,9 +570,10 @@ impl App {
             }
             "help" => {
                 self.networks[ni].status_mut().push(Line::system(
-                    "commands: /join /part /msg /query /me /nick /topic /whois /away /mode \
-                     /kick /invite /raw /names /monitor /setname /close /server /images \
-                     /unfurl /joins /notify /theme /lang /highlight /ignore /dim /upload /react /reply /redact /quit",
+                    "commands: /join /part /cycle /msg /notice /query /me /nick /topic /whois /whowas \
+                     /away /back /mode /kick /invite /raw /ctcp /names /monitor /setname /close /clear \
+                     /clearall /ns /cs /ms /identify /server /images /unfurl /joins /notify /theme /lang \
+                     /highlight /ignore /dim /upload /react /reply /redact /quit",
                 ));
                 self.active = ActiveBuffer { net: ni, buf: 0 };
             }
@@ -744,6 +862,22 @@ impl App {
             modes,
             args: targets,
         });
+    }
+
+    /// Send a raw command line to a services pseudo-client (NickServ/ChanServ/…)
+    /// as a PRIVMSG. The statusbar confirmation is intentionally body-free so a
+    /// password in `/identify` or `/ns identify` never lands on screen.
+    fn cmd_service(&mut self, ni: usize, service: &str, msg: &str) {
+        let msg = msg.trim();
+        if msg.is_empty() {
+            self.set_status(format!("usage: /{} <command…>", service.to_lowercase()));
+            return;
+        }
+        let _ = self.networks[ni].out.try_send(Outgoing::Privmsg {
+            target: service.to_string(),
+            text: msg.to_string(),
+        });
+        self.set_status(format!("sent to {service}"));
     }
 
     /// The active buffer's channel name, if it is a channel.

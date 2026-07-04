@@ -1563,4 +1563,82 @@ mod tests {
         assert_eq!(app.active.net, 0);
         assert_eq!(app.networks[0].buffers[app.active.buf].name, "#rust");
     }
+
+    #[test]
+    fn clear_wipes_active_buffer_scrollback() {
+        let (mut app, _out) = app_with_outbox();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        for _ in 0..5 {
+            app.networks[0].buffers[bi].push(Line::system("noise"));
+        }
+        app.networks[0].buffers[bi].scroll = 3;
+        app.run_command("clear");
+        assert!(app.networks[0].buffers[bi].lines.is_empty());
+        assert_eq!(app.networks[0].buffers[bi].scroll, 0);
+    }
+
+    #[test]
+    fn notice_sends_notice_on_wire_and_echoes_locally() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.run_command("notice #c hello world");
+        // Multi-word text must ride as a single trailing parameter.
+        match out_rx.try_recv() {
+            Ok(Outgoing::Raw { cmd, args }) => {
+                assert_eq!(cmd, "NOTICE");
+                assert_eq!(args, vec!["#c".to_string(), "hello world".to_string()]);
+            }
+            _ => panic!("expected NOTICE raw"),
+        }
+        // Without echo-message the notice is echoed into the target buffer.
+        let bi = app.networks[0].find_buffer("#c").expect("notice opened the buffer");
+        let last = app.networks[0].buffers[bi].lines.last().expect("echoed line");
+        assert!(matches!(last.kind, LineKind::Notice));
+        assert_eq!(last.text, "hello world");
+    }
+
+    #[test]
+    fn ctcp_uppercases_verb_but_not_argument() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.run_command("ctcp bob ping 12345");
+        match out_rx.try_recv() {
+            Ok(Outgoing::Ctcp { target, query }) => {
+                assert_eq!(target, "bob");
+                assert_eq!(query, "PING 12345");
+            }
+            _ => panic!("expected CTCP"),
+        }
+    }
+
+    #[test]
+    fn cycle_parts_then_rejoins_active_channel() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.run_command("cycle");
+        assert!(matches!(out_rx.try_recv(), Ok(Outgoing::Part { channel, .. }) if channel == "#c"));
+        assert!(matches!(out_rx.try_recv(), Ok(Outgoing::Join(channel)) if channel == "#c"));
+        // The buffer stays open across the cycle.
+        assert!(app.networks[0].find_buffer("#c").is_some());
+    }
+
+    #[test]
+    fn identify_prefixes_nickserv_verb() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.run_command("identify hunter2");
+        match out_rx.try_recv() {
+            Ok(Outgoing::Privmsg { target, text }) => {
+                assert_eq!(target, "NickServ");
+                assert_eq!(text, "IDENTIFY hunter2");
+            }
+            _ => panic!("expected PRIVMSG to NickServ"),
+        }
+    }
+
+    #[test]
+    fn back_clears_away() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.run_command("back");
+        assert!(matches!(out_rx.try_recv(), Ok(Outgoing::Away(None))));
+    }
 }

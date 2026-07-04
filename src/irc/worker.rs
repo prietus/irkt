@@ -1100,6 +1100,11 @@ fn format_numeric(code: Response, args: &[String]) -> Option<String> {
         Response::RPL_WHOISCHANNELS if args.len() >= 3 => Some(format!("whois {}: channels {}", p(1), p(2))),
         Response::RPL_ENDOFWHOIS if args.len() >= 2 => Some(format!("whois {}: end", p(1))),
         Response::RPL_WHOISCERTFP if args.len() >= 3 => Some(format!("whois {}: {}", p(1), p(2))),
+        Response::RPL_WHOWASUSER if args.len() >= 6 => {
+            Some(format!("whowas {}: {}!{}@{} — {}", p(1), p(1), p(2), p(3), p(5)))
+        }
+        Response::RPL_ENDOFWHOWAS if args.len() >= 2 => Some(format!("whowas {}: end", p(1))),
+        Response::ERR_WASNOSUCHNICK if args.len() >= 3 => Some(format!("there was no such nick: {}", p(1))),
         Response::ERR_NOSUCHNICK if args.len() >= 3 => Some(format!("no such nick: {}", p(1))),
         Response::ERR_NOSUCHCHANNEL if args.len() >= 3 => Some(format!("no such channel: {}", p(1))),
         Response::ERR_CHANOPRIVSNEEDED if args.len() >= 3 => Some(format!("not channel operator: {}", p(1))),

@@ -351,9 +351,11 @@ fn complete_path(word: &str) -> Vec<String> {
 }
 
 pub(crate) const COMMANDS: &[&str] = &[
-    "join", "part", "msg", "query", "me", "nick", "topic", "whois", "away", "mode", "kick",
+    "join", "part", "cycle", "msg", "notice", "query", "me", "nick", "topic", "whois", "whowas",
+    "away", "back", "mode", "kick",
     "op", "deop", "voice", "devoice", "ban", "unban",
-    "invite", "raw", "names", "monitor", "buddy", "setname", "close", "server", "images",
+    "invite", "raw", "ctcp", "names", "monitor", "buddy", "setname", "close", "clear", "clearall",
+    "ns", "cs", "ms", "identify", "server", "images",
     "unfurl", "joins", "notify", "theme", "lang", "highlight", "ignore", "dim", "upload", "react", "reply", "redact", "quit",
     "help",
 ];
