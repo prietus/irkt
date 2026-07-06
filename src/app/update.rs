@@ -186,11 +186,15 @@ impl App {
                     });
                 }
                 // Our own join (including bouncer reconnect): pull recent backlog
-                // and WHO the channel so we learn which members are bots (NAMES
-                // can't carry the bot flag; only WHO's flags field does).
+                // and WHO the whole channel so we learn which members are bots
+                // (NAMES can't carry the bot flag; only WHO's flags field does).
+                // A live join by someone else: WHO just the newcomer, so their bot
+                // badge appears immediately instead of only after a rejoin.
                 if is_self {
                     self.request_latest_history(ni, bi);
                     self.request_who(ni, &channel);
+                } else {
+                    self.request_who(ni, &nick);
                 }
                 let net = &mut self.networks[ni];
                 if !is_self {
@@ -327,11 +331,22 @@ impl App {
             }
             Event::WhoReply { channel, nick, is_bot } => {
                 // Annotate an existing member only — WHO doesn't define membership
-                // (NAMES does), it just enriches it. A bot flag never un-sets here.
-                if let Some(roster) = self.networks[ni].members.get_mut(&channel.to_lowercase())
+                // (NAMES does), it just enriches it. Fast path: a channel WHO's
+                // reply names its channel, so update that roster directly.
+                let net = &mut self.networks[ni];
+                if let Some(roster) = net.members.get_mut(&channel.to_lowercase())
                     && let Some(m) = roster.iter_mut().find(|e| e.nick.eq_ignore_ascii_case(&nick))
                 {
                     m.is_bot = is_bot;
+                    return;
+                }
+                // A `WHO <nick>` reply can carry `*` or a channel we don't track for
+                // its channel field. Bot-mode is a global user property, so set the
+                // flag wherever that nick appears in this network's rosters.
+                for roster in net.members.values_mut() {
+                    if let Some(m) = roster.iter_mut().find(|e| e.nick.eq_ignore_ascii_case(&nick)) {
+                        m.is_bot = is_bot;
+                    }
                 }
             }
             Event::Topic { channel, topic } => {
@@ -550,16 +565,17 @@ impl App {
         });
     }
 
-    /// Ask the server for a WHO of `channel` so member bot flags (and, in
-    /// principle, away state) can be filled in. Fire-and-forget: the replies
-    /// come back as `Event::WhoReply` and annotate the roster NAMES built.
-    fn request_who(&mut self, ni: usize, channel: &str) {
-        if ni >= self.networks.len() {
+    /// Ask the server for a WHO of `target` (a channel or a single nick) so member
+    /// bot flags can be filled in. Fire-and-forget: the replies come back as
+    /// `Event::WhoReply` and annotate the roster NAMES built. Skipped entirely on
+    /// servers that don't advertise bot-mode, since that's WHO's only consumer.
+    fn request_who(&mut self, ni: usize, target: &str) {
+        if ni >= self.networks.len() || self.networks[ni].isupport.bot_mode.is_none() {
             return;
         }
         let _ = self.networks[ni].out.try_send(Outgoing::Raw {
             cmd: "WHO".into(),
-            args: vec![channel.to_string()],
+            args: vec![target.to_string()],
         });
     }
 
@@ -963,6 +979,17 @@ mod tests {
         assert!(roster.iter().find(|m| m.nick == "botnick").unwrap().is_bot);
         assert!(!roster.iter().find(|m| m.nick == "alice").unwrap().is_bot);
         assert!(!roster.iter().any(|m| m.nick == "ghost"));
+    }
+
+    // A `WHO <nick>` reply may carry `*` as its channel; the global fallback must
+    // still set the bot flag wherever the nick is a member.
+    #[test]
+    fn who_reply_with_star_channel_sets_bot_via_fallback() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me");
+        app.apply_event(0, names("#c", &["me", "botnick"]));
+        app.apply_event(0, Event::WhoReply { channel: "*".into(), nick: "botnick".into(), is_bot: true });
+        assert!(app.networks[0].members["#c"].iter().find(|m| m.nick == "botnick").unwrap().is_bot);
     }
 
     // NAMES repeating a nick, or a JOIN racing NAMES, must not double-list anyone.
@@ -1693,5 +1720,44 @@ mod tests {
         let (mut app, mut out_rx) = app_with_outbox();
         app.run_command("back");
         assert!(matches!(out_rx.try_recv(), Ok(Outgoing::Away(None))));
+    }
+
+    #[test]
+    fn live_join_whos_the_newcomer_for_bot_flag() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].nick = "me".into();
+        app.networks[0].isupport.bot_mode = Some('B');
+        app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.apply_event(0, Event::UserJoined {
+            channel: "#c".into(), nick: "botnick".into(),
+            userhost: None, account: None, realname: None, meta: meta(),
+        });
+        let mut saw_who = false;
+        while let Ok(msg) = out_rx.try_recv() {
+            if let Outgoing::Raw { cmd, args } = msg {
+                if cmd == "WHO" && args == vec!["botnick".to_string()] {
+                    saw_who = true;
+                }
+            }
+        }
+        assert!(saw_who, "a live join should WHO the newcomer for their bot flag");
+    }
+
+    #[test]
+    fn no_who_when_server_lacks_bot_mode() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].nick = "me".into();
+        // bot_mode defaults to None -> WHO is pointless and must be skipped.
+        app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.apply_event(0, Event::UserJoined {
+            channel: "#c".into(), nick: "someone".into(),
+            userhost: None, account: None, realname: None, meta: meta(),
+        });
+        while let Ok(msg) = out_rx.try_recv() {
+            assert!(
+                !matches!(msg, Outgoing::Raw { ref cmd, .. } if cmd == "WHO"),
+                "no WHO without bot-mode support"
+            );
+        }
     }
 }
