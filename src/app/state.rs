@@ -41,6 +41,15 @@ pub enum BufferKind {
     Query,
 }
 
+/// A clickable target found inside a rendered chat line (see [`App::chat_links`]).
+#[derive(Clone, Debug)]
+pub enum ClickLink {
+    /// A channel name (`#foo`, `##rust`); clicking joins it.
+    Channel(String),
+    /// An `http(s)://` URL; clicking opens it in the system browser.
+    Url(String),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
     Message,
@@ -370,6 +379,10 @@ pub struct App {
     /// Horizontal extent `(x_start, x_end)` of the chat message area, so a click
     /// is only treated as a message hit when `x_start <= x < x_end`.
     pub chat_x: (u16, u16),
+    /// Clickable spans inside chat lines, recorded each draw: `(screen row y,
+    /// col_start, col_end, target)` with `col_start <= x < col_end`. Lets a click
+    /// on a `#channel` join it or on a URL open it. Only used when `mouse = true`.
+    pub chat_links: Vec<(u16, u16, u16, ClickLink)>,
     /// Clickable member-list rows, recorded each draw for mouse hit-testing:
     /// `(screen row y, nick)`. Empty when the member panel is hidden. Only
     /// populated/used when `mouse = true`.
@@ -431,6 +444,7 @@ impl App {
             sidebar_w: 0,
             chat_rows: Vec::new(),
             chat_x: (0, 0),
+            chat_links: Vec::new(),
             member_rows: Vec::new(),
             member_x: (0, 0),
             visible_anims: Vec::new(),

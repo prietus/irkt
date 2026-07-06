@@ -163,7 +163,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     // Drop last frame's click targets; they're repopulated below unless an
     // early return leaves the chat empty.
     app.chat_rows.clear();
-    // Likewise last frame's visible-animation list; repopulated as we draw.
+    // Likewise last frame's clickable channel/URL spans and visible-animation list.
+    app.chat_links.clear();
     app.visible_anims.clear();
     // Topic / header row + messages.
     let parts = Layout::default()
@@ -318,6 +319,20 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let end = total.saturating_sub(scroll);
     let start = end.saturating_sub(height);
     let visible: Vec<RLine> = rows[start..end].to_vec();
+
+    // Record clickable channel/URL spans in the visible rows for mouse hit-testing.
+    // We scan the already-laid-out rows (gutter + body) so column offsets include
+    // the timestamp/nick prefix without re-deriving it.
+    let chantypes = {
+        let ct = &app.networks[ni].isupport.chantypes;
+        if ct.is_empty() { "#&".to_string() } else { ct.clone() }
+    };
+    for (vi, rline) in visible.iter().enumerate() {
+        let y = body.y + vi as u16;
+        let text: String = rline.spans.iter().map(|s| s.content.as_ref()).collect();
+        scan_row_links(&text, body.x, y, &chantypes, &mut app.chat_links);
+    }
+
     f.render_widget(Paragraph::new(visible), body);
 
     // Record where each selectable message landed on screen, for mouse clicks.
@@ -721,6 +736,48 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Find clickable `#channel` and `http(s)://` tokens in an already-laid-out chat
+/// row (gutter included), pushing their screen-column spans for mouse hit-testing.
+/// Word boundaries are single spaces and neither a channel nor a URL contains one,
+/// so each is captured whole on its row. Offsets are display widths so wide glyphs
+/// line up with the cursor.
+fn scan_row_links(
+    text: &str,
+    base_x: u16,
+    y: u16,
+    chantypes: &str,
+    out: &mut Vec<(u16, u16, u16, ClickLink)>,
+) {
+    let mut col = base_x as usize;
+    for part in text.split(' ') {
+        let w = part.width();
+        if let Some(link) = classify_token(part, chantypes) {
+            let start = col.min(u16::MAX as usize) as u16;
+            let end = (col + w).min(u16::MAX as usize) as u16;
+            out.push((y, start, end, link));
+        }
+        col += w + 1; // account for the space the split consumed
+    }
+}
+
+/// Classify a whitespace-delimited token as a joinable channel, an openable URL,
+/// or nothing. Trailing sentence punctuation is trimmed from the target so a
+/// `#chan.` or `url)` still resolves cleanly.
+fn classify_token(tok: &str, chantypes: &str) -> Option<ClickLink> {
+    let trimmed = tok.trim_end_matches(['.', ',', ')', '!', '?', ';', ':', '\'']);
+    if trimmed.chars().count() < 2 {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(ClickLink::Url(trimmed.to_string()));
+    }
+    let first = trimmed.chars().next()?;
+    if chantypes.contains(first) {
+        return Some(ClickLink::Channel(trimmed.to_string()));
+    }
+    None
+}
+
 fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
     // Repopulated below; cleared up-front so an early return (no members) can't
     // leave stale click targets on screen.
@@ -765,10 +822,15 @@ fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
         if y < inner.y + inner.height {
             hits.push((y, m.nick.clone()));
         }
-        lines.push(RLine::from(vec![
+        let mut row = vec![
             Span::styled(prefix.to_string(), Style::default().fg(pcolor)),
             Span::styled(m.nick.clone(), Style::default().fg(t.nick(&m.nick))),
-        ]));
+        ];
+        // IRCv3 bot-mode badge (learned from the channel WHO).
+        if m.is_bot {
+            row.push(Span::styled(" 🤖", Style::default().fg(t.dim)));
+        }
+        lines.push(RLine::from(row));
     }
     f.render_widget(Paragraph::new(lines), inner);
     app.member_rows = hits;
@@ -1146,8 +1208,8 @@ mod render_tests {
         app.networks[0].members.insert(
             "#chan".into(),
             vec![
-                MemberEntry { nick: "alice".into(), prefixes: "@".into(), userhost: None },
-                MemberEntry { nick: "bob".into(), prefixes: String::new(), userhost: None },
+                MemberEntry { nick: "alice".into(), prefixes: "@".into(), userhost: None, is_bot: false },
+                MemberEntry { nick: "bob".into(), prefixes: String::new(), userhost: None, is_bot: true },
             ],
         );
         app.active = ActiveBuffer { net: 0, buf: bi };
@@ -1263,5 +1325,63 @@ mod render_tests {
             }
         }
         assert!(found, "bob's line should be on screen");
+    }
+
+    #[test]
+    fn classify_and_scan_channel_and_url_tokens() {
+        // Channels (with trailing punctuation trimmed) and URLs are recognised;
+        // plain words and bare prefixes are not.
+        assert!(matches!(classify_token("#botnet", "#&"), Some(ClickLink::Channel(c)) if c == "#botnet"));
+        assert!(matches!(classify_token("##rust", "#&"), Some(ClickLink::Channel(c)) if c == "##rust"));
+        assert!(matches!(classify_token("#chan,", "#&"), Some(ClickLink::Channel(c)) if c == "#chan"));
+        assert!(matches!(classify_token("&local", "#&"), Some(ClickLink::Channel(c)) if c == "&local"));
+        assert!(matches!(classify_token("https://ex.com/x).", "#&"), Some(ClickLink::Url(u)) if u == "https://ex.com/x"));
+        assert!(classify_token("hello", "#&").is_none());
+        assert!(classify_token("#", "#&").is_none());
+
+        // Column offsets in a laid-out row account for the leading gutter text.
+        let mut out = Vec::new();
+        scan_row_links("ab #foo cd", 0, 5, "#&", &mut out);
+        assert_eq!(out.len(), 1);
+        let (y, cs, ce, link) = &out[0];
+        assert_eq!((*y, *cs, *ce), (5, 3, 7)); // "#foo" occupies cols 3..7
+        assert!(matches!(link, ClickLink::Channel(c) if c == "#foo"));
+    }
+
+    #[test]
+    fn chat_click_on_channel_name_joins_it() {
+        use crate::irc::Outgoing;
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, mut out_rx) = mpsc::channel(8);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        app.networks[0].buffers[bi].push(Line {
+            time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
+            text: "join #other now".into(), msgid: Some("m1".into()), highlight: false, reply_to: None,
+        });
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = false;
+
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        // "#other" registered a clickable channel span.
+        let (y, cs, _ce, _l) = app
+            .chat_links
+            .iter()
+            .find(|(_, _, _, l)| matches!(l, ClickLink::Channel(c) if c == "#other"))
+            .cloned()
+            .expect("channel link recorded");
+
+        crate::keys::click(&mut app, cs, y);
+        // It joined and focused the new channel buffer.
+        assert!(matches!(
+            out_rx.try_recv(),
+            Ok(Outgoing::Raw { cmd, args }) if cmd == "JOIN" && args == vec!["#other".to_string()]
+        ));
+        assert_eq!(app.active_buffer().unwrap().name, "#other");
     }
 }

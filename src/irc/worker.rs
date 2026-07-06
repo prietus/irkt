@@ -1021,6 +1021,16 @@ fn translate(
                 if nicks.is_empty() { vec![] } else { vec![Event::Presence { nicks, online: false }] }
             }
             Response::RPL_MONLIST | Response::RPL_ENDOFMONLIST => vec![],
+            // WHO reply (352): `<me> <chan> <user> <host> <server> <nick> <flags> :<hop realname>`.
+            // The flags field carries `B` for IRCv3 bot-mode users. We annotate the
+            // roster silently — no status-buffer line — and swallow the 315 terminator.
+            Response::RPL_WHOREPLY if args.len() >= 7 => {
+                vec![Event::WhoReply {
+                    channel: args[1].clone(),
+                    nick: args[5].clone(),
+                    is_bot: args[6].contains('B'),
+                }]
+            }
             _ => format_numeric(code, &args)
                 .or_else(|| render_raw_numeric(code as u16, &args))
                 .map(|text| vec![Event::Notice { from: "*".into(), text, meta }])
@@ -1214,6 +1224,13 @@ fn apply_isupport_token(isupport: &mut ISupport, tok: &str) -> bool {
                 return true;
             }
         }
+        "BOT" => {
+            let new = value.and_then(|v| v.chars().next());
+            if isupport.bot_mode != new {
+                isupport.bot_mode = new;
+                return true;
+            }
+        }
         "MONITOR" => {
             let new = value.and_then(|v| v.parse::<u32>().ok()).or(Some(u32::MAX));
             if isupport.monitor_limit != new {
@@ -1291,13 +1308,18 @@ fn format_extended_numeric(code: u16, args: &[String]) -> Option<String> {
 fn is_suppressed_numeric(code: u16) -> bool {
     matches!(
         code,
-        1 | 2 | 3 | 4 | 5 | 251 | 252 | 253 | 254 | 255 | 265 | 266 | 372 | 375 | 376 | 422
+        1 | 2 | 3 | 4 | 5 | 251 | 252 | 253 | 254 | 255 | 265 | 266 | 315 | 372 | 375 | 376 | 422
     )
 }
 
 fn render_raw_numeric(code: u16, args: &[String]) -> Option<String> {
     if is_suppressed_numeric(code) {
         return None;
+    }
+    // RPL_WHOISBOT (335): `<me> <nick> :is a bot…`. Not a variant in irc-proto, so
+    // it lands here — format it like the other whois lines instead of `[335] …`.
+    if code == 335 && args.len() >= 3 {
+        return Some(format!("whois {}: {}", args[1], args[2..].join(" ")));
     }
     let body = if args.len() > 1 { args[1..].join(" ") } else { args.join(" ") };
     Some(format!("[{code}] {body}"))
@@ -1385,7 +1407,7 @@ fn parse_name_entry(token: &str) -> Option<MemberEntry> {
         Some((n, uh)) if !uh.is_empty() => (n.to_string(), Some(uh.to_string())),
         _ => (rest.to_string(), None),
     };
-    Some(MemberEntry { nick, prefixes: prefixes.to_string(), userhost })
+    Some(MemberEntry { nick, prefixes: prefixes.to_string(), userhost, is_bot: false })
 }
 
 fn unwrap_ctcp_action(body: &str) -> Option<String> {

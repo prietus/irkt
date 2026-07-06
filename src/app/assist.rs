@@ -208,7 +208,7 @@ mod tests {
             "#rust".into(),
             members
                 .iter()
-                .map(|n| MemberEntry { nick: (*n).into(), prefixes: String::new(), userhost: None })
+                .map(|n| MemberEntry { nick: (*n).into(), prefixes: String::new(), userhost: None, is_bot: false })
                 .collect(),
         );
         app.active = ActiveBuffer { net: 0, buf: bi };

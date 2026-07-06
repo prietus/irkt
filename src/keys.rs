@@ -156,20 +156,45 @@ pub(crate) fn click(app: &mut App, x: u16, y: u16) {
         app.open_query(&nick);
         return;
     }
-    // A click inside the chat area selects (or toggles off) that message.
-    if x >= app.chat_x.0
-        && x < app.chat_x.1
-        && let Some((_, mid)) = app.chat_rows.iter().find(|(ry, _)| *ry == y)
-    {
-        let mid = mid.clone();
-        if let Some(buf) = app.active_buffer_mut() {
-            buf.selection = if buf.selection.as_deref() == Some(mid.as_str()) {
-                None
-            } else {
-                Some(mid)
-            };
+    if x >= app.chat_x.0 && x < app.chat_x.1 {
+        // A click on a `#channel` or URL span acts on it, taking priority over
+        // selecting the underlying message.
+        if let Some(link) = app
+            .chat_links
+            .iter()
+            .find(|(ry, cs, ce, _)| *ry == y && x >= *cs && x < *ce)
+            .map(|(_, _, _, l)| l.clone())
+        {
+            match link {
+                ClickLink::Channel(c) => app.join_channel(&c),
+                ClickLink::Url(u) => open_in_browser(&u),
+            }
+            return;
+        }
+        // Otherwise a click selects (or toggles off) the clicked message.
+        if let Some((_, mid)) = app.chat_rows.iter().find(|(ry, _)| *ry == y) {
+            let mid = mid.clone();
+            if let Some(buf) = app.active_buffer_mut() {
+                buf.selection = if buf.selection.as_deref() == Some(mid.as_str()) {
+                    None
+                } else {
+                    Some(mid)
+                };
+            }
         }
     }
+}
+
+/// Best-effort open of a URL in the user's default browser. Fire-and-forget: a
+/// missing opener is silently ignored (the user can still read/copy the URL).
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let (prog, pre): (&str, &[&str]) = ("open", &[]);
+    #[cfg(target_os = "windows")]
+    let (prog, pre): (&str, &[&str]) = ("cmd", &["/C", "start", ""]);
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let (prog, pre): (&str, &[&str]) = ("xdg-open", &[]);
+    let _ = std::process::Command::new(prog).args(pre).arg(url).spawn();
 }
 
 pub(crate) fn scroll(app: &mut App, delta: i32) {
@@ -354,7 +379,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "join", "part", "cycle", "msg", "notice", "query", "me", "nick", "topic", "whois", "whowas",
     "away", "back", "mode", "kick",
     "op", "deop", "voice", "devoice", "ban", "unban",
-    "invite", "raw", "ctcp", "names", "monitor", "buddy", "setname", "close", "clear", "clearall",
+    "invite", "raw", "ctcp", "names", "monitor", "buddy", "setname", "bot", "close", "clear", "clearall",
     "ns", "cs", "ms", "identify", "server", "images",
     "unfurl", "joins", "notify", "theme", "lang", "highlight", "ignore", "dim", "upload", "react", "reply", "redact", "quit",
     "help",

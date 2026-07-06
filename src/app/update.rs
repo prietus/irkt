@@ -182,11 +182,15 @@ impl App {
                         nick: nick.clone(),
                         prefixes: String::new(),
                         userhost: None,
+                        is_bot: false,
                     });
                 }
-                // Our own join (including bouncer reconnect): pull recent backlog.
+                // Our own join (including bouncer reconnect): pull recent backlog
+                // and WHO the channel so we learn which members are bots (NAMES
+                // can't carry the bot flag; only WHO's flags field does).
                 if is_self {
                     self.request_latest_history(ni, bi);
+                    self.request_who(ni, &channel);
                 }
                 let net = &mut self.networks[ni];
                 if !is_self {
@@ -319,6 +323,15 @@ impl App {
                     } else {
                         roster.push(m);
                     }
+                }
+            }
+            Event::WhoReply { channel, nick, is_bot } => {
+                // Annotate an existing member only — WHO doesn't define membership
+                // (NAMES does), it just enriches it. A bot flag never un-sets here.
+                if let Some(roster) = self.networks[ni].members.get_mut(&channel.to_lowercase())
+                    && let Some(m) = roster.iter_mut().find(|e| e.nick.eq_ignore_ascii_case(&nick))
+                {
+                    m.is_bot = is_bot;
                 }
             }
             Event::Topic { channel, topic } => {
@@ -534,6 +547,19 @@ impl App {
         let _ = net.out.try_send(Outgoing::ChatHistoryLatest {
             target,
             limit: HISTORY_LIMIT,
+        });
+    }
+
+    /// Ask the server for a WHO of `channel` so member bot flags (and, in
+    /// principle, away state) can be filled in. Fire-and-forget: the replies
+    /// come back as `Event::WhoReply` and annotate the roster NAMES built.
+    fn request_who(&mut self, ni: usize, channel: &str) {
+        if ni >= self.networks.len() {
+            return;
+        }
+        let _ = self.networks[ni].out.try_send(Outgoing::Raw {
+            cmd: "WHO".into(),
+            args: vec![channel.to_string()],
         });
     }
 
@@ -888,6 +914,7 @@ mod tests {
                     nick: (*n).to_string(),
                     prefixes: String::new(),
                     userhost: None,
+                    is_bot: false,
                 })
                 .collect(),
         }
@@ -917,6 +944,25 @@ mod tests {
         for n in ["me", "a", "b", "c", "d", "e"] {
             assert!(roster.iter().any(|m| m.nick == n), "{n} present");
         }
+    }
+
+    // A WHO reply annotates an existing member's bot flag, ignores unknown nicks,
+    // and never adds membership (NAMES is authoritative for that).
+    #[test]
+    fn who_reply_sets_bot_flag_on_known_member_only() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me");
+        app.apply_event(0, names("#c", &["me", "botnick", "alice"]));
+        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "botnick".into(), is_bot: true });
+        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "alice".into(), is_bot: false });
+        // A WHO row for a nick NAMES never listed must not appear in the roster.
+        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "ghost".into(), is_bot: true });
+
+        let roster = &app.networks[0].members["#c"];
+        assert_eq!(roster.len(), 3, "WHO never adds membership");
+        assert!(roster.iter().find(|m| m.nick == "botnick").unwrap().is_bot);
+        assert!(!roster.iter().find(|m| m.nick == "alice").unwrap().is_bot);
+        assert!(!roster.iter().any(|m| m.nick == "ghost"));
     }
 
     // NAMES repeating a nick, or a JOIN racing NAMES, must not double-list anyone.
@@ -1108,7 +1154,14 @@ mod tests {
             channel: "#rust".into(), nick: "me".into(),
             userhost: None, account: None, realname: None, meta: meta(),
         });
-        assert!(out_rx.try_recv().is_err(), "must not request history without the cap");
+        // A self-join still WHOs the channel (to learn bot flags), but with no
+        // chathistory cap it must never request backlog.
+        while let Ok(msg) = out_rx.try_recv() {
+            assert!(
+                !matches!(msg, Outgoing::ChatHistoryLatest { .. }),
+                "must not request history without the cap"
+            );
+        }
     }
 
     #[test]
@@ -1395,7 +1448,7 @@ mod tests {
             let name = app.networks[0].buffers[ch].name.to_lowercase();
             app.networks[0].members.insert(
                 name,
-                vec![crate::irc::MemberEntry { nick: "alice".into(), prefixes: String::new(), userhost: None }],
+                vec![crate::irc::MemberEntry { nick: "alice".into(), prefixes: String::new(), userhost: None, is_bot: false }],
             );
         }
         app.apply_event(0, Event::Privmsg {

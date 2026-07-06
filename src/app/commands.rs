@@ -363,6 +363,21 @@ impl App {
             "setname" => {
                 let _ = self.networks[ni].out.try_send(Outgoing::SetName(rest.to_string()));
             }
+            "bot" => {
+                // Announce (or clear) yourself as a bot via the IRCv3 bot user mode.
+                let Some(letter) = self.networks[ni].isupport.bot_mode else {
+                    self.set_status("server doesn't advertise bot-mode (no BOT= in ISUPPORT)");
+                    return;
+                };
+                let sign = if matches!(rest.trim(), "off" | "-" | "no") { '-' } else { '+' };
+                let nick = self.networks[ni].nick.clone();
+                let _ = self.networks[ni].out.try_send(Outgoing::Mode {
+                    target: nick,
+                    modes: format!("{sign}{letter}"),
+                    args: vec![],
+                });
+                self.set_status(format!("bot mode {}", if sign == '+' { "on" } else { "off" }));
+            }
             "close" | "wc" => {
                 let bi = self.active.buf;
                 if bi == 0 {
@@ -571,7 +586,7 @@ impl App {
             "help" => {
                 self.networks[ni].status_mut().push(Line::system(
                     "commands: /join /part /cycle /msg /notice /query /me /nick /topic /whois /whowas \
-                     /away /back /mode /kick /invite /raw /ctcp /names /monitor /setname /close /clear \
+                     /away /back /mode /kick /invite /raw /ctcp /names /monitor /setname /bot /close /clear \
                      /clearall /ns /cs /ms /identify /server /images /unfurl /joins /notify /theme /lang \
                      /highlight /ignore /dim /upload /react /reply /redact /quit",
                 ));
@@ -862,6 +877,21 @@ impl App {
             modes,
             args: targets,
         });
+    }
+
+    /// Join `chan` on the active network and focus its buffer. Shared by the
+    /// `/join` command's no-key path and by clicking a `#channel` name in chat.
+    pub(crate) fn join_channel(&mut self, chan: &str) {
+        let ni = self.active.net;
+        if ni >= self.networks.len() {
+            return;
+        }
+        let _ = self.networks[ni].out.try_send(Outgoing::Raw {
+            cmd: "JOIN".into(),
+            args: vec![chan.to_string()],
+        });
+        let bi = self.networks[ni].ensure_buffer(chan, BufferKind::Channel);
+        self.active = ActiveBuffer { net: ni, buf: bi };
     }
 
     /// Send a raw command line to a services pseudo-client (NickServ/ChanServ/…)
