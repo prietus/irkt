@@ -62,6 +62,9 @@ pub struct MemberEntry {
     /// IRCv3 bot-mode flag (set from a WHO reply's `B` flag). Drives a badge in
     /// the member panel. NAMES can't carry it, so it stays false until WHO fills it.
     pub is_bot: bool,
+    /// Away flag. Seeded from a WHO reply's `G` (gone) flag and kept live by
+    /// `away-notify` AWAY messages. Away members are dimmed in the member panel.
+    pub is_away: bool,
 }
 
 /// Per-message metadata extracted from IRCv3 tags.
@@ -162,8 +165,9 @@ pub enum Event {
     ChatHistoryBatchEnd { target: String },
     NickChanged { old: String, new: String, meta: MsgMeta },
     Names { channel: String, members: Vec<MemberEntry> },
-    /// One RPL_WHOREPLY (352) row: annotates a known member with their bot flag.
-    WhoReply { channel: String, nick: String, is_bot: bool },
+    /// One RPL_WHOREPLY (352) row: annotates a known member with their bot and
+    /// away flags (the `B` and `G` markers in the reply's flags field).
+    WhoReply { channel: String, nick: String, is_bot: bool, is_away: bool },
     Topic { channel: String, topic: String },
     Notice { from: String, text: String, meta: MsgMeta },
     CtcpReply { from: String, query: String, args: String },

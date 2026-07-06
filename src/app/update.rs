@@ -183,6 +183,7 @@ impl App {
                         prefixes: String::new(),
                         userhost: None,
                         is_bot: false,
+                        is_away: false,
                     });
                 }
                 // Our own join (including bouncer reconnect): pull recent backlog
@@ -329,7 +330,7 @@ impl App {
                     }
                 }
             }
-            Event::WhoReply { channel, nick, is_bot } => {
+            Event::WhoReply { channel, nick, is_bot, is_away } => {
                 // Annotate an existing member only — WHO doesn't define membership
                 // (NAMES does), it just enriches it. Fast path: a channel WHO's
                 // reply names its channel, so update that roster directly.
@@ -338,14 +339,16 @@ impl App {
                     && let Some(m) = roster.iter_mut().find(|e| e.nick.eq_ignore_ascii_case(&nick))
                 {
                     m.is_bot = is_bot;
+                    m.is_away = is_away;
                     return;
                 }
                 // A `WHO <nick>` reply can carry `*` or a channel we don't track for
-                // its channel field. Bot-mode is a global user property, so set the
-                // flag wherever that nick appears in this network's rosters.
+                // its channel field. Bot-mode and away are global user properties, so
+                // set the flags wherever that nick appears in this network's rosters.
                 for roster in net.members.values_mut() {
                     if let Some(m) = roster.iter_mut().find(|e| e.nick.eq_ignore_ascii_case(&nick)) {
                         m.is_bot = is_bot;
+                        m.is_away = is_away;
                     }
                 }
             }
@@ -384,10 +387,17 @@ impl App {
                 let text = format!("{nick} changed host to {ident}@{host}");
                 self.push_to_member_channels(ni, &nick, &text);
             }
-            Event::AwayChanged { .. } => {
-                // away-notify is intentionally not rendered as chat lines — it
-                // is far too chatty in busy channels. The cap is still
-                // negotiated so future presence UI can consume it.
+            Event::AwayChanged { nick, message, .. } => {
+                // away-notify is intentionally not rendered as chat lines — it is
+                // far too chatty in busy channels. Instead we track presence: flip
+                // the member's away flag (a non-empty message means gone) across
+                // every roster this nick appears in, so the panel dims them live.
+                let away = message.is_some();
+                for roster in self.networks[ni].members.values_mut() {
+                    if let Some(m) = roster.iter_mut().find(|e| e.nick.eq_ignore_ascii_case(&nick)) {
+                        m.is_away = away;
+                    }
+                }
             }
             Event::Redacted { target, msgid, by_nick, reason } => {
                 let net = &mut self.networks[ni];
@@ -566,11 +576,18 @@ impl App {
     }
 
     /// Ask the server for a WHO of `target` (a channel or a single nick) so member
-    /// bot flags can be filled in. Fire-and-forget: the replies come back as
-    /// `Event::WhoReply` and annotate the roster NAMES built. Skipped entirely on
-    /// servers that don't advertise bot-mode, since that's WHO's only consumer.
+    /// bot and away flags can be filled in. Fire-and-forget: the replies come back
+    /// as `Event::WhoReply` and annotate the roster NAMES built. Skipped when
+    /// neither consumer is active — no bot-mode advertised and no `away-notify`
+    /// acked — since the reply would tell us nothing we render.
     fn request_who(&mut self, ni: usize, target: &str) {
-        if ni >= self.networks.len() || self.networks[ni].isupport.bot_mode.is_none() {
+        if ni >= self.networks.len() {
+            return;
+        }
+        let net = &self.networks[ni];
+        let wants_who = net.isupport.bot_mode.is_some()
+            || net.caps.iter().any(|c| c == "away-notify");
+        if !wants_who {
             return;
         }
         let _ = self.networks[ni].out.try_send(Outgoing::Raw {
@@ -931,6 +948,7 @@ mod tests {
                     prefixes: String::new(),
                     userhost: None,
                     is_bot: false,
+                    is_away: false,
                 })
                 .collect(),
         }
@@ -969,10 +987,10 @@ mod tests {
         let mut app = test_app();
         joins(&mut app, "#c", "me");
         app.apply_event(0, names("#c", &["me", "botnick", "alice"]));
-        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "botnick".into(), is_bot: true });
-        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "alice".into(), is_bot: false });
+        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "botnick".into(), is_bot: true, is_away: false });
+        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "alice".into(), is_bot: false, is_away: false });
         // A WHO row for a nick NAMES never listed must not appear in the roster.
-        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "ghost".into(), is_bot: true });
+        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "ghost".into(), is_bot: true, is_away: false });
 
         let roster = &app.networks[0].members["#c"];
         assert_eq!(roster.len(), 3, "WHO never adds membership");
@@ -988,7 +1006,7 @@ mod tests {
         let mut app = test_app();
         joins(&mut app, "#c", "me");
         app.apply_event(0, names("#c", &["me", "botnick"]));
-        app.apply_event(0, Event::WhoReply { channel: "*".into(), nick: "botnick".into(), is_bot: true });
+        app.apply_event(0, Event::WhoReply { channel: "*".into(), nick: "botnick".into(), is_bot: true, is_away: false });
         assert!(app.networks[0].members["#c"].iter().find(|m| m.nick == "botnick").unwrap().is_bot);
     }
 
@@ -1475,7 +1493,7 @@ mod tests {
             let name = app.networks[0].buffers[ch].name.to_lowercase();
             app.networks[0].members.insert(
                 name,
-                vec![crate::irc::MemberEntry { nick: "alice".into(), prefixes: String::new(), userhost: None, is_bot: false }],
+                vec![crate::irc::MemberEntry { nick: "alice".into(), prefixes: String::new(), userhost: None, is_bot: false, is_away: false }],
             );
         }
         app.apply_event(0, Event::Privmsg {
@@ -1759,5 +1777,59 @@ mod tests {
                 "no WHO without bot-mode support"
             );
         }
+    }
+
+    // A WHO reply's `G` flag seeds a member's away status just like `B` seeds bot.
+    #[test]
+    fn who_reply_seeds_away_flag() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me");
+        app.apply_event(0, names("#c", &["me", "alice"]));
+        app.apply_event(0, Event::WhoReply { channel: "#c".into(), nick: "alice".into(), is_bot: false, is_away: true });
+        let roster = &app.networks[0].members["#c"];
+        assert!(roster.iter().find(|m| m.nick == "alice").unwrap().is_away);
+    }
+
+    // away-notify AWAY messages flip a member's presence live: a message means gone,
+    // an empty AWAY means back. The flag updates in every roster the nick is in.
+    #[test]
+    fn away_notify_toggles_member_presence() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me");
+        joins(&mut app, "#d", "me");
+        app.apply_event(0, names("#c", &["me", "alice"]));
+        app.apply_event(0, names("#d", &["me", "alice"]));
+
+        app.apply_event(0, Event::AwayChanged { nick: "alice".into(), message: Some("brb".into()), meta: meta() });
+        assert!(app.networks[0].members["#c"].iter().find(|m| m.nick == "alice").unwrap().is_away);
+        assert!(app.networks[0].members["#d"].iter().find(|m| m.nick == "alice").unwrap().is_away);
+
+        app.apply_event(0, Event::AwayChanged { nick: "alice".into(), message: None, meta: meta() });
+        assert!(!app.networks[0].members["#c"].iter().find(|m| m.nick == "alice").unwrap().is_away);
+        assert!(!app.networks[0].members["#d"].iter().find(|m| m.nick == "alice").unwrap().is_away);
+    }
+
+    // WHO is worth sending for its away flag even on a server without bot-mode, as
+    // long as away-notify is acked — the reply seeds initial presence.
+    #[test]
+    fn who_fires_with_away_notify_even_without_bot_mode() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].nick = "me".into();
+        // No bot_mode, but away-notify is negotiated.
+        app.networks[0].caps = vec!["away-notify".into()];
+        app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.apply_event(0, Event::UserJoined {
+            channel: "#c".into(), nick: "someone".into(),
+            userhost: None, account: None, realname: None, meta: meta(),
+        });
+        let mut saw_who = false;
+        while let Ok(msg) = out_rx.try_recv() {
+            if let Outgoing::Raw { cmd, args } = msg
+                && cmd == "WHO" && args == vec!["someone".to_string()]
+            {
+                saw_who = true;
+            }
+        }
+        assert!(saw_who, "away-notify alone should justify WHOing a newcomer");
     }
 }

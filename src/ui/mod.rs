@@ -822,9 +822,15 @@ fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
         if y < inner.y + inner.height {
             hits.push((y, m.nick.clone()));
         }
+        // away-notify: dim the whole row for members marked gone.
+        let nick_style = if m.is_away {
+            Style::default().fg(t.dim).add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(t.nick(&m.nick))
+        };
         let mut row = vec![
             Span::styled(prefix.to_string(), Style::default().fg(pcolor)),
-            Span::styled(m.nick.clone(), Style::default().fg(t.nick(&m.nick))),
+            Span::styled(m.nick.clone(), nick_style),
         ];
         // IRCv3 bot-mode badge (learned from the channel WHO).
         if m.is_bot {
@@ -1208,8 +1214,8 @@ mod render_tests {
         app.networks[0].members.insert(
             "#chan".into(),
             vec![
-                MemberEntry { nick: "alice".into(), prefixes: "@".into(), userhost: None, is_bot: false },
-                MemberEntry { nick: "bob".into(), prefixes: String::new(), userhost: None, is_bot: true },
+                MemberEntry { nick: "alice".into(), prefixes: "@".into(), userhost: None, is_bot: false, is_away: true },
+                MemberEntry { nick: "bob".into(), prefixes: String::new(), userhost: None, is_bot: true, is_away: false },
             ],
         );
         app.active = ActiveBuffer { net: 0, buf: bi };

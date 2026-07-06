@@ -1022,13 +1022,15 @@ fn translate(
             }
             Response::RPL_MONLIST | Response::RPL_ENDOFMONLIST => vec![],
             // WHO reply (352): `<me> <chan> <user> <host> <server> <nick> <flags> :<hop realname>`.
-            // The flags field carries `B` for IRCv3 bot-mode users. We annotate the
-            // roster silently — no status-buffer line — and swallow the 315 terminator.
+            // The flags field carries `B` for IRCv3 bot-mode users and `G`/`H` for
+            // gone/here (away) status. We annotate the roster silently — no
+            // status-buffer line — and swallow the 315 terminator.
             Response::RPL_WHOREPLY if args.len() >= 7 => {
                 vec![Event::WhoReply {
                     channel: args[1].clone(),
                     nick: args[5].clone(),
                     is_bot: args[6].contains('B'),
+                    is_away: args[6].contains('G'),
                 }]
             }
             _ => format_numeric(code, &args)
@@ -1407,7 +1409,7 @@ fn parse_name_entry(token: &str) -> Option<MemberEntry> {
         Some((n, uh)) if !uh.is_empty() => (n.to_string(), Some(uh.to_string())),
         _ => (rest.to_string(), None),
     };
-    Some(MemberEntry { nick, prefixes: prefixes.to_string(), userhost, is_bot: false })
+    Some(MemberEntry { nick, prefixes: prefixes.to_string(), userhost, is_bot: false, is_away: false })
 }
 
 fn unwrap_ctcp_action(body: &str) -> Option<String> {
