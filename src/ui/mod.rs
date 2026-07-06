@@ -1020,9 +1020,9 @@ mod render_tests {
             msgid: Some("m2".into()), highlight: false, reply_to: Some("p1".into()),
         });
         // Two people react to bob's reply with a heart, one with thumbs up.
-        net.buffers[bi].add_reaction("m2".into(), "♥".into(), "carol".into());
-        net.buffers[bi].add_reaction("m2".into(), "♥".into(), "dave".into());
-        net.buffers[bi].add_reaction("m2".into(), "+1".into(), "carol".into());
+        net.buffers[bi].add_reaction("m2".into(), "♥".into(), "carol".into(), None);
+        net.buffers[bi].add_reaction("m2".into(), "♥".into(), "dave".into(), None);
+        net.buffers[bi].add_reaction("m2".into(), "+1".into(), "carol".into(), None);
         app.active = ActiveBuffer { net: 0, buf: bi };
         app.show_members = false;
 

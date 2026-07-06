@@ -178,7 +178,7 @@ pub enum Event {
     TypingChanged { target: String, nick: String, state: TypingState },
     ReadMarker { target: String, timestamp: Option<String> },
     Redacted { target: String, msgid: String, by_nick: String, reason: Option<String> },
-    Reaction { target: String, target_msgid: String, nick: String, emoji: String },
+    Reaction { target: String, target_msgid: String, nick: String, emoji: String, msgid: Option<String> },
     Presence { nicks: Vec<String>, online: bool },
 }
 

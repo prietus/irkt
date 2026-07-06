@@ -105,6 +105,10 @@ pub struct Buffer {
     pub typing: Vec<(String, std::time::Instant)>,
     /// Reactions keyed by the reacted message's msgid: emoji -> nicks.
     pub reactions: std::collections::HashMap<String, Vec<(String, Vec<String>)>>,
+    /// Reverse index: the reaction TAGMSG's own msgid -> (reacted msgid, emoji,
+    /// nick). An "unreact" arrives as a REDACT of that reaction message, so this
+    /// lets us undo the exact reaction without a part/rejoin.
+    pub react_index: std::collections::HashMap<String, (String, String, String)>,
     /// The msgid of the currently selected message (for reply/react), if any.
     /// Stored by msgid (not index) so it survives buffer truncation.
     pub selection: Option<String>,
@@ -140,6 +144,7 @@ impl Buffer {
             topic: None,
             typing: Vec::new(),
             reactions: std::collections::HashMap::new(),
+            react_index: std::collections::HashMap::new(),
             selection: None,
             history_stage: Vec::new(),
             history_stage_oldest_ts: None,
@@ -206,7 +211,12 @@ impl Buffer {
     }
 
     /// Record a reaction `emoji` from `nick` to the message `msgid` (deduped).
-    pub fn add_reaction(&mut self, msgid: String, emoji: String, nick: String) {
+    /// `react_msgid` is the reaction TAGMSG's own id, if the server tagged it —
+    /// indexing it lets a later REDACT ("unreact") undo this exact reaction.
+    pub fn add_reaction(&mut self, msgid: String, emoji: String, nick: String, react_msgid: Option<String>) {
+        if let Some(rid) = react_msgid {
+            self.react_index.insert(rid, (msgid.clone(), emoji.clone(), nick.clone()));
+        }
         let entry = self.reactions.entry(msgid).or_default();
         if let Some((_, nicks)) = entry.iter_mut().find(|(e, _)| *e == emoji) {
             if !nicks.iter().any(|n| n.eq_ignore_ascii_case(&nick)) {
@@ -215,6 +225,28 @@ impl Buffer {
         } else {
             entry.push((emoji, vec![nick]));
         }
+    }
+
+    /// Undo the reaction carried by the reaction message `react_msgid` (an
+    /// "unreact", delivered as a REDACT of that message). Prunes the nick, then
+    /// the emoji group and the message entry if they become empty. Returns true
+    /// if a reaction was actually removed.
+    pub fn remove_reaction_by_msgid(&mut self, react_msgid: &str) -> bool {
+        let Some((msgid, emoji, nick)) = self.react_index.remove(react_msgid) else {
+            return false;
+        };
+        if let Some(groups) = self.reactions.get_mut(&msgid) {
+            if let Some(pos) = groups.iter().position(|(e, _)| *e == emoji) {
+                groups[pos].1.retain(|n| !n.eq_ignore_ascii_case(&nick));
+                if groups[pos].1.is_empty() {
+                    groups.remove(pos);
+                }
+            }
+            if groups.is_empty() {
+                self.reactions.remove(&msgid);
+            }
+        }
+        true
     }
 
     /// True if `nick` authored a message or action within the last `window`

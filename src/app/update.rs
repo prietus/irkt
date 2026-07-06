@@ -403,6 +403,11 @@ impl App {
                 let net = &mut self.networks[ni];
                 if let Some(bi) = net.find_buffer(&target) {
                     let buf = &mut net.buffers[bi];
+                    // A redact of a reaction message is an "unreact": drop that
+                    // reaction and stop — it never had a content line to blank.
+                    if buf.remove_reaction_by_msgid(&msgid) {
+                        return;
+                    }
                     if let Some(line) = buf.lines.iter_mut().find(|l| l.msgid.as_deref() == Some(msgid.as_str())) {
                         let who = if by_nick == line.from { "(deleted)".to_string() } else { format!("(deleted by {by_nick})") };
                         line.text = match &reason {
@@ -414,12 +419,14 @@ impl App {
                     }
                 }
             }
-            Event::Reaction { target, target_msgid, nick, emoji } => {
+            Event::Reaction { target, target_msgid, nick, emoji, msgid } => {
                 let net = &mut self.networks[ni];
                 let bname = if net.is_channel(&target) { target.clone() } else { nick.clone() };
                 if let Some(bi) = net.find_buffer(&bname) {
-                    // Attach the reaction to its message; rendered as a badge.
-                    net.buffers[bi].add_reaction(target_msgid, emoji, nick);
+                    // Attach the reaction to its message; rendered as a badge. The
+                    // reaction message's own msgid is indexed so a later REDACT
+                    // ("unreact") can undo exactly this reaction.
+                    net.buffers[bi].add_reaction(target_msgid, emoji, nick, msgid);
                 }
             }
             Event::ReadMarker { .. } => {
@@ -1831,5 +1838,49 @@ mod tests {
             }
         }
         assert!(saw_who, "away-notify alone should justify WHOing a newcomer");
+    }
+
+    // A reaction is attached live and, when its reaction message is redacted
+    // ("unreact"), removed live — no part/rejoin needed.
+    #[test]
+    fn unreact_removes_the_reaction_live() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me");
+        app.apply_event(0, Event::Reaction {
+            target: "#c".into(), target_msgid: "m1".into(),
+            nick: "alice".into(), emoji: "♥".into(), msgid: Some("react1".into()),
+        });
+        let bi = app.networks[0].find_buffer("#c").unwrap();
+        assert_eq!(app.networks[0].buffers[bi].reactions["m1"][0].1, vec!["alice".to_string()]);
+
+        // The unreact: a REDACT of the reaction message's own id.
+        app.apply_event(0, Event::Redacted {
+            target: "#c".into(), msgid: "react1".into(), by_nick: "alice".into(), reason: None,
+        });
+        assert!(
+            !app.networks[0].buffers[bi].reactions.contains_key("m1"),
+            "unreact should drop the reaction entry entirely"
+        );
+    }
+
+    // One of two reactors unreacting leaves the other's reaction intact.
+    #[test]
+    fn unreact_prunes_only_the_redacted_reactor() {
+        let mut app = test_app();
+        joins(&mut app, "#c", "me");
+        app.apply_event(0, Event::Reaction {
+            target: "#c".into(), target_msgid: "m1".into(),
+            nick: "alice".into(), emoji: "♥".into(), msgid: Some("ra".into()),
+        });
+        app.apply_event(0, Event::Reaction {
+            target: "#c".into(), target_msgid: "m1".into(),
+            nick: "bob".into(), emoji: "♥".into(), msgid: Some("rb".into()),
+        });
+        app.apply_event(0, Event::Redacted {
+            target: "#c".into(), msgid: "ra".into(), by_nick: "alice".into(), reason: None,
+        });
+        let bi = app.networks[0].find_buffer("#c").unwrap();
+        let hearts = &app.networks[0].buffers[bi].reactions["m1"][0].1;
+        assert_eq!(hearts, &vec!["bob".to_string()], "only alice's heart should be pruned");
     }
 }

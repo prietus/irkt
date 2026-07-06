@@ -1061,7 +1061,7 @@ fn translate(
                 }];
             }
             if cmd.eq_ignore_ascii_case("TAGMSG") && !args.is_empty() {
-                if let Some(events) = parse_tagmsg_event(&nick, &args[0], &msg_tags_raw) {
+                if let Some(events) = parse_tagmsg_event(&nick, &args[0], &msg_tags_raw, meta.msgid.clone()) {
                     return events;
                 }
                 return vec![];
@@ -1143,7 +1143,12 @@ fn format_numeric(code: Response, args: &[String]) -> Option<String> {
     }
 }
 
-fn parse_tagmsg_event(nick: &str, target: &str, tags: &[(String, Option<String>)]) -> Option<Vec<Event>> {
+fn parse_tagmsg_event(
+    nick: &str,
+    target: &str,
+    tags: &[(String, Option<String>)],
+    own_msgid: Option<String>,
+) -> Option<Vec<Event>> {
     let mut typing: Option<TypingState> = None;
     let mut reply_msgid: Option<String> = None;
     let mut react_emoji: Option<String> = None;
@@ -1163,6 +1168,7 @@ fn parse_tagmsg_event(nick: &str, target: &str, tags: &[(String, Option<String>)
             target_msgid: msgid,
             nick: nick.to_string(),
             emoji,
+            msgid: own_msgid,
         }]);
     }
     if let Some(state) = typing {
