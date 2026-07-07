@@ -336,6 +336,9 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         if app.should_quit {
             break;
         }
+        // If the user switched buffers this batch, freeze the left buffer's
+        // read-marker so its "new messages" separator is positioned for next time.
+        need_redraw |= app.freeze_left_buffer_marker();
         // Advance any animation frames now due — both when the wake *was* the
         // frame deadline and when frames came due while a batch was processing.
         if app.advance_anims() {

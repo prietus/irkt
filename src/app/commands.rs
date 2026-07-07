@@ -133,6 +133,7 @@ impl App {
                         msgid: None,
                         highlight: false,
                         reply_to: None,
+                        ts_iso: None,
                     });
                 }
             }
@@ -171,6 +172,7 @@ impl App {
                         msgid: None,
                         highlight: false,
                         reply_to: None,
+                        ts_iso: None,
                     });
                 }
             }
@@ -204,6 +206,7 @@ impl App {
                         msgid: None,
                         highlight: false,
                         reply_to: None,
+                        ts_iso: None,
                     });
                 }
             }

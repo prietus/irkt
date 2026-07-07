@@ -150,6 +150,7 @@ impl App {
                     msgid: meta.msgid,
                     highlight: false,
                     reply_to: None,
+                    ts_iso: meta.server_time_iso,
                 };
                 // Server notices land in the status buffer.
                 self.push_to(ni, 0, line);
@@ -207,6 +208,7 @@ impl App {
                         msgid: None,
                         highlight: false,
                         reply_to: None,
+                        ts_iso: None,
                     };
                     net.buffers[bi].push(line);
                 }
@@ -238,6 +240,7 @@ impl App {
                         msgid: None,
                         highlight: false,
                         reply_to: None,
+                        ts_iso: None,
                     });
                 }
             }
@@ -268,6 +271,7 @@ impl App {
                             msgid: None,
                             highlight: false,
                             reply_to: None,
+                            ts_iso: None,
                         });
                     }
                 }
@@ -306,6 +310,7 @@ impl App {
                         msgid: None,
                         highlight: false,
                         reply_to: None,
+                        ts_iso: None,
                     });
                 }
             }
@@ -429,8 +434,21 @@ impl App {
                     net.buffers[bi].add_reaction(target_msgid, emoji, nick, msgid);
                 }
             }
-            Event::ReadMarker { .. } => {
-                // No dedicated UI yet; safely ignored.
+            Event::ReadMarker { target, timestamp } => {
+                // A MARKREAD from the server: another of our clients (or this one,
+                // echoed) advanced the read position. Move the separator forward —
+                // but never for the buffer we're *currently looking at*, so our own
+                // just-sent MARKREAD echo doesn't erase the separator mid-read.
+                let Some(ts) = timestamp else { return };
+                let Some(bi) = self.networks[ni].find_buffer(&target) else { return };
+                if self.active.net == ni && self.active.buf == bi {
+                    return;
+                }
+                let rm = &mut self.networks[ni].buffers[bi].read_marker;
+                // Only ever advance (later ISO wins); ignore stale markers.
+                if rm.as_deref().is_none_or(|cur| ts.as_str() > cur) {
+                    *rm = Some(ts);
+                }
             }
             Event::ChatHistoryBatchEnd { target } => self.finish_history_batch(ni, &target),
             Event::Presence { nicks, online } => {
@@ -521,6 +539,7 @@ impl App {
             msgid: meta.msgid.clone(),
             highlight,
             reply_to,
+            ts_iso: meta.server_time_iso.clone(),
         };
         // Replayed history (an open `chathistory` batch): stage it for a
         // chronological prepend when the batch closes, deduped by msgid. It must
@@ -729,6 +748,7 @@ impl App {
                 msgid: None,
                 highlight: false,
                 reply_to: Some(parent),
+                ts_iso: None,
             });
         }
         // Drop the selection once we've replied.
@@ -760,6 +780,7 @@ impl App {
                 msgid: None,
                 highlight: false,
                 reply_to: None,
+                ts_iso: None,
             });
         }
     }
@@ -1374,7 +1395,7 @@ mod tests {
         let bi = app.networks[0].ensure_buffer("#rust", BufferKind::Channel);
         app.networks[0].buffers[bi].push(Line {
             time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
-            text: "question?".into(), msgid: Some("p1".into()), highlight: false, reply_to: None,
+            text: "question?".into(), msgid: Some("p1".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         app.active = ActiveBuffer { net: 0, buf: bi };
 
@@ -1414,7 +1435,7 @@ mod tests {
         for id in ["p1", "p2"] {
             app.networks[0].buffers[bi].push(Line {
                 time: String::new(), kind: LineKind::Message, from: "x".into(),
-                text: id.into(), msgid: Some(id.into()), highlight: false, reply_to: None,
+                text: id.into(), msgid: Some(id.into()), highlight: false, reply_to: None, ts_iso: None,
             });
         }
         app.active = ActiveBuffer { net: 0, buf: bi };
@@ -1444,7 +1465,7 @@ mod tests {
         for (i, id) in ["a", "b", "c"].iter().enumerate() {
             app.networks[0].buffers[bi].push(Line {
                 time: String::new(), kind: LineKind::Message, from: "x".into(),
-                text: format!("m{i}"), msgid: Some(id.to_string()), highlight: false, reply_to: None,
+                text: format!("m{i}"), msgid: Some(id.to_string()), highlight: false, reply_to: None, ts_iso: None,
             });
         }
         let buf = &mut app.networks[0].buffers[bi];
@@ -1472,11 +1493,11 @@ mod tests {
         let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
         app.networks[0].buffers[bi].push(Line {
             time: String::new(), kind: LineKind::Message, from: "alice".into(),
-            text: "older".into(), msgid: Some("p1".into()), highlight: false, reply_to: None,
+            text: "older".into(), msgid: Some("p1".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         app.networks[0].buffers[bi].push(Line {
             time: String::new(), kind: LineKind::Message, from: "bob".into(),
-            text: "newer".into(), msgid: Some("p2".into()), highlight: false, reply_to: None,
+            text: "newer".into(), msgid: Some("p2".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         app.active = ActiveBuffer { net: 0, buf: bi };
         // Select the OLDER message, then type + Enter.
@@ -1882,5 +1903,106 @@ mod tests {
         let bi = app.networks[0].find_buffer("#c").unwrap();
         let hearts = &app.networks[0].buffers[bi].reactions["m1"][0].1;
         assert_eq!(hearts, &vec!["bob".to_string()], "only alice's heart should be pruned");
+    }
+
+    // Deliver a channel message stamped with a specific ISO server-time.
+    fn msg_at(app: &mut App, chan: &str, iso: &str, msgid: &str, text: &str) {
+        app.apply_event(0, Event::Privmsg {
+            target: chan.into(),
+            nick: "alice".into(),
+            body: text.into(),
+            meta: MsgMeta {
+                server_time_hhmm: Some("00:00".into()),
+                server_time_iso: Some(iso.into()),
+                msgid: Some(msgid.into()),
+                ..MsgMeta::default()
+            },
+        });
+    }
+
+    // Leaving a buffer freezes its read marker at the latest message, so the next
+    // visit draws the "new messages" rule below what we already saw.
+    #[test]
+    fn leaving_a_buffer_freezes_its_read_marker() {
+        let (mut app, _rx) = app_with_outbox();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.last_active = app.active;
+        msg_at(&mut app, "#c", "2026-01-01T10:00:00.000Z", "m1", "hi");
+        // Switch away to the status buffer.
+        app.active = ActiveBuffer { net: 0, buf: 0 };
+        assert!(app.freeze_left_buffer_marker(), "marker moved on leave");
+        assert_eq!(
+            app.networks[0].buffers[bi].read_marker.as_deref(),
+            Some("2026-01-01T10:00:00.000Z")
+        );
+    }
+
+    // Entering a buffer that had unread traffic sends MARKREAD to sync the read
+    // position outward (soju forwards it to your other clients).
+    #[test]
+    fn entering_unread_buffer_sends_markread() {
+        let (mut app, mut rx) = app_with_outbox();
+        app.networks[0].caps = vec!["draft/read-marker".into()];
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        // Active is the status buffer, so the message counts as unread.
+        msg_at(&mut app, "#c", "2026-01-01T10:00:00.000Z", "m1", "hi");
+        assert!(app.networks[0].buffers[bi].unread > 0);
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.mark_active_read();
+        let mut saw = None;
+        while let Ok(m) = rx.try_recv() {
+            if let Outgoing::MarkRead { target, timestamp } = m {
+                saw = Some((target, timestamp));
+            }
+        }
+        assert_eq!(saw, Some(("#c".to_string(), Some("2026-01-01T10:00:00.000Z".to_string()))));
+    }
+
+    #[test]
+    fn no_markread_without_the_cap() {
+        let (mut app, mut rx) = app_with_outbox();
+        // No caps negotiated.
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        msg_at(&mut app, "#c", "2026-01-01T10:00:00.000Z", "m1", "hi");
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.mark_active_read();
+        while let Ok(m) = rx.try_recv() {
+            assert!(!matches!(m, Outgoing::MarkRead { .. }), "no MARKREAD without the cap");
+        }
+    }
+
+    // Inbound MARKREAD advances a non-active buffer's marker, only ever forward.
+    #[test]
+    fn inbound_markread_advances_non_active_only_forward() {
+        let (mut app, _rx) = app_with_outbox();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        // Active stays on the status buffer.
+        let mark = |app: &mut App, iso: &str| {
+            app.apply_event(0, Event::ReadMarker { target: "#c".into(), timestamp: Some(iso.into()) });
+        };
+        mark(&mut app, "2026-01-01T09:00:00.000Z");
+        assert_eq!(app.networks[0].buffers[bi].read_marker.as_deref(), Some("2026-01-01T09:00:00.000Z"));
+        mark(&mut app, "2026-01-01T10:00:00.000Z"); // later -> advances
+        assert_eq!(app.networks[0].buffers[bi].read_marker.as_deref(), Some("2026-01-01T10:00:00.000Z"));
+        mark(&mut app, "2026-01-01T08:00:00.000Z"); // earlier -> ignored
+        assert_eq!(app.networks[0].buffers[bi].read_marker.as_deref(), Some("2026-01-01T10:00:00.000Z"));
+    }
+
+    // A MARKREAD for the buffer we're looking at (our own echo) must not clear the
+    // separator out from under us.
+    #[test]
+    fn inbound_markread_ignored_for_active_buffer() {
+        let (mut app, _rx) = app_with_outbox();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.apply_event(0, Event::ReadMarker {
+            target: "#c".into(),
+            timestamp: Some("2026-01-01T10:00:00.000Z".into()),
+        });
+        assert_eq!(
+            app.networks[0].buffers[bi].read_marker, None,
+            "echo for the active buffer must not move the marker"
+        );
     }
 }

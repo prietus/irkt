@@ -2,7 +2,7 @@
 
 use crate::config::{AppConfig, NetworkConfig};
 use crate::images::Images;
-use crate::irc::{ISupport, MemberEntry, OutgoingTx};
+use crate::irc::{ISupport, MemberEntry, Outgoing, OutgoingTx};
 use crate::theme::Theme;
 
 pub type NetId = usize;
@@ -73,6 +73,10 @@ pub struct Line {
     pub highlight: bool,
     /// `+draft/reply` parent msgid, when this message is a threaded reply.
     pub reply_to: Option<String>,
+    /// Full ISO8601 `server-time` of the message, when present. Used to place the
+    /// read-marker separator and to pick the timestamp for an outgoing MARKREAD.
+    /// `None` for locally-generated lines (our echoes, join/part/system churn).
+    pub ts_iso: Option<String>,
 }
 
 impl Line {
@@ -85,6 +89,7 @@ impl Line {
             msgid: None,
             highlight: false,
             reply_to: None,
+            ts_iso: None,
         }
     }
 }
@@ -112,6 +117,11 @@ pub struct Buffer {
     /// The msgid of the currently selected message (for reply/react), if any.
     /// Stored by msgid (not index) so it survives buffer truncation.
     pub selection: Option<String>,
+    /// ISO8601 `server-time` of the last-read message. A "new messages" separator
+    /// is drawn before the first line newer than this. Advanced when we leave the
+    /// buffer and by inbound `MARKREAD` sync (via soju), so read state follows you
+    /// across devices. `None` means nothing is marked (no separator).
+    pub read_marker: Option<String>,
     /// CHATHISTORY messages collected during an open `chathistory` batch, in
     /// chronological order; prepended to `lines` when the batch closes.
     pub history_stage: Vec<Line>,
@@ -146,6 +156,7 @@ impl Buffer {
             reactions: std::collections::HashMap::new(),
             react_index: std::collections::HashMap::new(),
             selection: None,
+            read_marker: None,
             history_stage: Vec::new(),
             history_stage_oldest_ts: None,
             oldest_history_ts: None,
@@ -249,6 +260,12 @@ impl Buffer {
         true
     }
 
+    /// ISO8601 `server-time` of the most recent line that carries one. Used as
+    /// the read position to freeze on leave and to send in MARKREAD.
+    pub fn latest_ts(&self) -> Option<String> {
+        self.lines.iter().rev().find_map(|l| l.ts_iso.clone())
+    }
+
     /// True if `nick` authored a message or action within the last `window`
     /// lines of this buffer. Used to decide whether a nick-change is worth
     /// surfacing here (people who never talk generate pure noise).
@@ -345,6 +362,10 @@ impl Network {
 pub struct App {
     pub networks: Vec<Network>,
     pub active: ActiveBuffer,
+    /// The active buffer as of the last main-loop tick. Diffing it against
+    /// `active` tells us when the user left a buffer, so we can freeze its read
+    /// marker (see [`Self::freeze_left_buffer_marker`]).
+    pub last_active: ActiveBuffer,
     pub input: String,
     /// Cursor position as a byte offset into `input`.
     pub cursor: usize,
@@ -448,6 +469,7 @@ impl App {
         App {
             networks: Vec::new(),
             active: ActiveBuffer { net: 0, buf: 0 },
+            last_active: ActiveBuffer { net: 0, buf: 0 },
             input: String::new(),
             cursor: 0,
             should_quit: false,
@@ -545,12 +567,45 @@ impl App {
         }
     }
 
-    /// Mark the active buffer read.
+    /// Mark the active buffer read: clear its unread/mention badges and, if it
+    /// had unread traffic, sync the read position outward with MARKREAD so other
+    /// clients on the same bouncer (soju) advance too. The on-screen "new
+    /// messages" separator is *not* moved here — it advances only on leave (see
+    /// [`Self::freeze_left_buffer_marker`]) so you can still see where you were.
     pub fn mark_active_read(&mut self) {
-        if let Some(b) = self.active_buffer_mut() {
-            b.unread = 0;
-            b.mentions = 0;
+        let (ni, bi) = (self.active.net, self.active.buf);
+        let Some(net) = self.networks.get_mut(ni) else { return };
+        let Some(buf) = net.buffers.get_mut(bi) else { return };
+        let had_unread = buf.unread > 0;
+        buf.unread = 0;
+        buf.mentions = 0;
+        if had_unread
+            && net.caps.iter().any(|c| c == "draft/read-marker")
+            && let Some(ts) = buf.latest_ts()
+        {
+            let target = buf.name.clone();
+            let _ = net.out.try_send(Outgoing::MarkRead { target, timestamp: Some(ts) });
         }
+    }
+
+    /// When the active buffer changes, freeze the *left* buffer's read marker at
+    /// its latest message. Next time you open it, the "new messages" separator
+    /// sits right below everything you'd already seen. Call once per main-loop
+    /// iteration. Returns true if a marker moved (a redraw hint).
+    pub fn freeze_left_buffer_marker(&mut self) -> bool {
+        if self.last_active == self.active {
+            return false;
+        }
+        let ActiveBuffer { net, buf } = self.last_active;
+        self.last_active = self.active;
+        if let Some(b) = self.networks.get_mut(net).and_then(|n| n.buffers.get_mut(buf))
+            && let Some(ts) = b.latest_ts()
+            && b.read_marker.as_deref() != Some(ts.as_str())
+        {
+            b.read_marker = Some(ts);
+            return true;
+        }
+        false
     }
 
     /// Move to the next/previous buffer, flattened across all networks.

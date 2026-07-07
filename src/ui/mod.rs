@@ -287,6 +287,8 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             images: &app.images,
             dimmed: &dimmed,
         };
+        let read_marker = buf.read_marker.as_deref();
+        let mut marker_drawn = false;
         for i in 0..lines.len() {
             if is_child[i] {
                 continue;
@@ -296,6 +298,16 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
                 && matches!(lines[i].kind, LineKind::Join | LineKind::Part | LineKind::Quit)
             {
                 continue;
+            }
+            // Read-marker: a "new messages" rule before the first line newer than
+            // where we last read. ISO server-times sort lexically, so a string
+            // compare is enough. Lines without a timestamp never trigger it.
+            if !marker_drawn
+                && let Some(rm) = read_marker
+                && lines[i].ts_iso.as_deref().is_some_and(|ts| ts > rm)
+            {
+                rows.push(read_marker_row(width, ctx.theme));
+                marker_drawn = true;
             }
             push_message(&ctx, i, 0, &mut rows, &mut placements, &mut sel_range, &mut row_msgids);
         }
@@ -386,6 +398,17 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             _ => {}
         }
     }
+}
+
+/// A full-width "── new messages ──" rule marking the read boundary.
+fn read_marker_row(width: usize, t: &Theme) -> RLine<'static> {
+    let label = " new messages ";
+    let cols = width.max(label.chars().count());
+    let dashes = cols - label.chars().count();
+    let left = 3.min(dashes);
+    let right = dashes - left;
+    let text = format!("{}{}{}", "─".repeat(left), label, "─".repeat(right));
+    RLine::from(Span::styled(text, Style::default().fg(t.accent)))
 }
 
 /// Shared context for the recursive message renderer.
@@ -499,10 +522,10 @@ fn push_message(
                 let mut spans = vec![Span::raw(" ".repeat(indent))];
                 for (emoji, nicks) in rx {
                     spans.push(Span::styled(
-                        format!(" {emoji} {} ", nicks.len()),
-                        Style::default().fg(t.badge_fg).bg(t.badge_bg),
+                        format!("{emoji} {}", nicks.len()),
+                        Style::default().fg(t.badge_fg),
                     ));
-                    spans.push(Span::raw(" "));
+                    spans.push(Span::raw("   "));
                 }
                 rows.push(RLine::from(spans));
             }
@@ -935,7 +958,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     if spans.is_empty() {
         // A selected (or react-target) message gets an action hint in place of
         // the generic help line — the workflow isn't obvious when you've just
-        // clicked a message with the mouse rather than used ⌥↑↓.
+        // clicked a message with the mouse rather than used alt+↑↓.
         if app.react_mode {
             spans.push(Span::styled(
                 " react: insert an emoji, then Enter · Esc cancel ",
@@ -943,16 +966,16 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             ));
         } else if app.active_buffer().is_some_and(|b| b.selection.is_some()) {
             spans.push(Span::styled(
-                " message selected — type to reply · ⌥R react · Esc cancel ",
+                " message selected — type to reply · alt+R react · Esc cancel ",
                 Style::default().fg(t.special).add_modifier(Modifier::BOLD),
             ));
         } else {
             let net = app.active_net().map(|n| n.cfg.name.as_str()).unwrap_or("-");
             let nick = app.active_net().map(|n| n.nick.as_str()).unwrap_or("-");
             let attach = if app.has_upload_target() { " · 📎 /upload" } else { "" };
-            let spell = if app.active_lang().is_some() { " · ⌥S fix" } else { "" };
+            let spell = if app.active_lang().is_some() { " · alt+S fix" } else { "" };
             spans.push(Span::styled(
-                format!(" irkt · {net} · {nick}  —  ^N/^P switch · ⌥↑↓ select · ⌥R react{attach}{spell} · Tab complete · ^C quit"),
+                format!(" irkt · {net} · {nick}  —  ^N/^P switch · alt+↑↓ select · alt+R react{attach}{spell} · Tab complete · ^C quit"),
                 Style::default().fg(t.dim),
             ));
         }
@@ -1012,12 +1035,12 @@ mod render_tests {
         net.buffers[bi].push(Line {
             time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
             text: "are we still meeting at 3pm today?".into(),
-            msgid: Some("p1".into()), highlight: false, reply_to: None,
+            msgid: Some("p1".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         net.buffers[bi].push(Line {
             time: "12:01".into(), kind: LineKind::Message, from: "bob".into(),
             text: "yes, see you then".into(),
-            msgid: Some("m2".into()), highlight: false, reply_to: Some("p1".into()),
+            msgid: Some("m2".into()), highlight: false, reply_to: Some("p1".into()), ts_iso: None,
         });
         // Two people react to bob's reply with a heart, one with thumbs up.
         net.buffers[bi].add_reaction("m2".into(), "♥".into(), "carol".into(), None);
@@ -1056,11 +1079,11 @@ mod render_tests {
         let bi = net.ensure_buffer("#chan", BufferKind::Channel);
         net.buffers[bi].push(Line {
             time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
-            text: "anyone around?".into(), msgid: Some("p1".into()), highlight: false, reply_to: None,
+            text: "anyone around?".into(), msgid: Some("p1".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         net.buffers[bi].push(Line {
             time: "12:01".into(), kind: LineKind::Message, from: "bob".into(),
-            text: "what's up".into(), msgid: Some("p2".into()), highlight: false, reply_to: None,
+            text: "what's up".into(), msgid: Some("p2".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         // Select alice's message (Alt+Up Alt+Up).
         net.buffers[bi].selection = Some("p1".into());
@@ -1091,7 +1114,7 @@ mod render_tests {
         let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
         app.networks[0].buffers[bi].push(Line {
             time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
-            text: "selected line".into(), msgid: Some("p1".into()), highlight: false, reply_to: None,
+            text: "selected line".into(), msgid: Some("p1".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         app.networks[0].buffers[bi].selection = Some("p1".into());
         app.active = ActiveBuffer { net: 0, buf: bi };
@@ -1136,7 +1159,7 @@ mod render_tests {
         let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
         app.networks[0].buffers[bi].push(Line {
             time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
-            text: "hi".into(), msgid: Some("m1".into()), highlight: false, reply_to: None,
+            text: "hi".into(), msgid: Some("m1".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         app.active = ActiveBuffer { net: 0, buf: bi };
         app.show_members = false;
@@ -1170,11 +1193,11 @@ mod render_tests {
         // A message with a msgid (selectable) and one without (not selectable).
         app.networks[0].buffers[bi].push(Line {
             time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
-            text: "click me".into(), msgid: Some("m1".into()), highlight: false, reply_to: None,
+            text: "click me".into(), msgid: Some("m1".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         app.networks[0].buffers[bi].push(Line {
             time: "12:01".into(), kind: LineKind::System, from: "".into(),
-            text: "no msgid here".into(), msgid: None, highlight: false, reply_to: None,
+            text: "no msgid here".into(), msgid: None, highlight: false, reply_to: None, ts_iso: None,
         });
         app.active = ActiveBuffer { net: 0, buf: bi };
         app.show_members = false;
@@ -1290,7 +1313,7 @@ mod render_tests {
         for (time, who, txt) in [("12:00", "alice", "hi all"), ("12:01", "bob", "spam spam")] {
             app.networks[0].buffers[bi].push(Line {
                 time: time.into(), kind: LineKind::Message, from: who.into(),
-                text: txt.into(), msgid: None, highlight: false, reply_to: None,
+                text: txt.into(), msgid: None, highlight: false, reply_to: None, ts_iso: None,
             });
         }
         app.active = ActiveBuffer { net: 0, buf: bi };
@@ -1366,7 +1389,7 @@ mod render_tests {
         let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
         app.networks[0].buffers[bi].push(Line {
             time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
-            text: "join #other now".into(), msgid: Some("m1".into()), highlight: false, reply_to: None,
+            text: "join #other now".into(), msgid: Some("m1".into()), highlight: false, reply_to: None, ts_iso: None,
         });
         app.active = ActiveBuffer { net: 0, buf: bi };
         app.show_members = false;
@@ -1389,5 +1412,39 @@ mod render_tests {
             Ok(Outgoing::Raw { cmd, args }) if cmd == "JOIN" && args == vec!["#other".to_string()]
         ));
         assert_eq!(app.active_buffer().unwrap().name, "#other");
+    }
+
+    #[test]
+    fn read_marker_separator_renders_between_read_and_unread() {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        app.networks[0].buffers[bi].push(Line {
+            time: "12:00".into(), kind: LineKind::Message, from: "alice".into(),
+            text: "old one".into(), msgid: Some("m1".into()), highlight: false, reply_to: None,
+            ts_iso: Some("2026-01-01T09:00:00.000Z".into()),
+        });
+        app.networks[0].buffers[bi].push(Line {
+            time: "12:05".into(), kind: LineKind::Message, from: "bob".into(),
+            text: "brand new".into(), msgid: Some("m2".into()), highlight: false, reply_to: None,
+            ts_iso: Some("2026-01-01T10:00:00.000Z".into()),
+        });
+        // We last read up to the first message.
+        app.networks[0].buffers[bi].read_marker = Some("2026-01-01T09:00:00.000Z".into());
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = false;
+
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let screen = buffer_to_string(&term);
+        let sep = screen.find("new messages").expect("separator label renders");
+        let old = screen.find("old one").expect("read message renders");
+        let new = screen.find("brand new").expect("unread message renders");
+        assert!(old < sep && sep < new, "separator sits between the read and unread messages");
     }
 }
