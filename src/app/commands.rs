@@ -124,18 +124,18 @@ impl App {
                 };
                 let bi = self.networks[ni].ensure_buffer(&target, kind);
                 let nick = self.networks[ni].nick.clone();
-                if !self.networks[ni].caps.iter().any(|c| c == "echo-message") {
-                    self.networks[ni].buffers[bi].push(Line {
-                        time: String::new(),
-                        kind: LineKind::Self_,
-                        from: nick,
-                        text,
-                        msgid: None,
-                        highlight: false,
-                        reply_to: None,
-                        ts_iso: None,
-                    });
-                }
+                // Optimistic local echo, always; an echo-message copy reconciles
+                // into this line instead of duplicating (see handle_msg).
+                self.networks[ni].buffers[bi].push(Line {
+                    time: String::new(),
+                    kind: LineKind::Self_,
+                    from: nick,
+                    text,
+                    msgid: None,
+                    highlight: false,
+                    reply_to: None,
+                    ts_iso: None,
+                });
             }
             "notice" => {
                 let Some((target, text)) = rest.split_once(char::is_whitespace) else {
@@ -195,20 +195,19 @@ impl App {
                     target: target.clone(),
                     text: rest.to_string(),
                 });
-                if !self.networks[ni].caps.iter().any(|c| c == "echo-message") {
-                    let nick = self.networks[ni].nick.clone();
-                    let bi = self.active.buf;
-                    self.networks[ni].buffers[bi].push(Line {
-                        time: String::new(),
-                        kind: LineKind::Action,
-                        from: nick,
-                        text: rest.to_string(),
-                        msgid: None,
-                        highlight: false,
-                        reply_to: None,
-                        ts_iso: None,
-                    });
-                }
+                // Optimistic local echo, always (see /msg above).
+                let nick = self.networks[ni].nick.clone();
+                let bi = self.active.buf;
+                self.networks[ni].buffers[bi].push(Line {
+                    time: String::new(),
+                    kind: LineKind::Action,
+                    from: nick,
+                    text: rest.to_string(),
+                    msgid: None,
+                    highlight: false,
+                    reply_to: None,
+                    ts_iso: None,
+                });
             }
             "nick" => {
                 if rest.is_empty() {

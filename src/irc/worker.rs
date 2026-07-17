@@ -113,14 +113,19 @@ struct CapState {
 /// Spawn a worker for one network. Returns the sender the UI uses to issue
 /// commands; the worker pushes [`Event`]s to `tx` for the lifetime of the
 /// connection (including reconnects).
-pub fn spawn_network(cfg: &NetworkConfig, tx: mpsc::Sender<Event>) -> OutgoingTx {
-    let (otx, orx) = mpsc::channel::<Outgoing>(64);
+pub fn spawn_network(cfg: &NetworkConfig, tx: mpsc::UnboundedSender<Event>) -> OutgoingTx {
+    let (otx, orx) = mpsc::channel::<Outgoing>(512);
     let cfg = cfg.clone();
     tokio::spawn(run(cfg, tx, orx));
     otx
 }
 
-async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Receiver<Outgoing>) {
+// `out` is unbounded on purpose: the worker must NEVER block on the UI. If it
+// did (bounded channel full during a burst), it would stop polling the socket,
+// miss the server's PING, and get dropped for a ping timeout — which is exactly
+// the "random disconnect + lost messages" failure mode. The UI drains in
+// batches, so the queue stays short in practice.
+async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx: mpsc::Receiver<Outgoing>) {
     // Apply a persisted IRCv3 STS policy if there is one.
     let sts_applied = if let Some(policy) = crate::config::sts::get_active(&cfg.server) {
         let mut changed = false;
@@ -143,8 +148,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                 from: "*".into(),
                 text: format!("STS policy active: forcing TLS on port {port} for {}", cfg.server),
                 meta: MsgMeta::default(),
-            })
-            .await;
+            });
     }
 
     let auth_mode = cfg.auth_mode();
@@ -170,8 +174,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                     from: "*".into(),
                     text: format!("authenticating with SASL {mech}…"),
                     meta: MsgMeta::default(),
-                })
-                .await;
+                });
         }
 
         let irc_cfg = Config {
@@ -194,10 +197,16 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
             source: Some("https://github.com/prietus/irkt".into()),
             // The crate sends its own PING every `ping_time`s and drops the
             // link if no PONG arrives within `ping_timeout`s — but it only
-            // checks while we're polling the socket. A wider grace window is
-            // cheap insurance so a brief UI hiccup can't be misread as a dead
-            // connection (the real fix is coalescing redraws in the UI loop).
-            ping_time: Some(120),
+            // checks while we're polling the socket. The PING/PONG round-trip
+            // is also our NAT keepalive: long-lived IRC links sit idle, and an
+            // aggressive NAT/firewall/CGNAT on the path silently drops an idle
+            // flow, then RSTs it (observed as "connection reset by peer" at the
+            // ingress and "server closed connection" here). 45s keeps the NAT
+            // mapping warm well under typical idle windows and detects a truly
+            // dead link sooner. The `ping_timeout` grace stays wide so a brief
+            // UI hiccup isn't misread as a dead connection (the real fix for
+            // that is coalescing redraws in the UI loop).
+            ping_time: Some(45),
             ping_timeout: Some(60),
             ..Config::default()
         };
@@ -229,7 +238,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                         Some(Ok(msg)) => {
                             if auth_phase == AuthPhase::Done {
                                 if let Some(updated) = handle_cap_notify(&msg, &sender, &mut cap_state) {
-                                    let _ = out.send(Event::CapsAcked(updated)).await;
+                                    let _ = out.send(Event::CapsAcked(updated));
                                 }
                                 if matches!(&msg.command, Command::CAP(..)) {
                                     continue;
@@ -244,14 +253,14 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                                         }
                                         auth_phase = AuthPhase::Done;
                                         let acked: Vec<String> = cap_state.acked.iter().cloned().collect();
-                                        let _ = out.send(Event::CapsAcked(acked)).await;
+                                        let _ = out.send(Event::CapsAcked(acked));
                                         diag_log(&cfg.name, "connected");
-                                        let _ = out.send(Event::Connected).await;
+                                        let _ = out.send(Event::Connected);
                                         attempt = 0;
                                     }
                                     AuthOutcome::Done => {
                                         let acked: Vec<String> = cap_state.acked.iter().cloned().collect();
-                                        let _ = out.send(Event::CapsAcked(acked)).await;
+                                        let _ = out.send(Event::CapsAcked(acked));
                                         let mech = match auth_mode {
                                             AuthMode::SaslExternal => "EXTERNAL",
                                             AuthMode::SaslPlain => "PLAIN",
@@ -262,10 +271,10 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                                                 from: "*".into(),
                                                 text: format!("SASL {mech} authentication successful"),
                                                 meta: MsgMeta::default(),
-                                            }).await;
+                                            });
                                         }
                                         diag_log(&cfg.name, "connected");
-                                        let _ = out.send(Event::Connected).await;
+                                        let _ = out.send(Event::Connected);
                                         attempt = 0;
                                     }
                                     AuthOutcome::Failed(reason) => {
@@ -289,12 +298,12 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                                     if let Some(info) = batches.remove(id) {
                                         if info.kind == "chathistory" {
                                             if let Some(target) = info.params.first() {
-                                                let _ = out.send(Event::ChatHistoryBatchEnd { target: target.clone() }).await;
+                                                let _ = out.send(Event::ChatHistoryBatchEnd { target: target.clone() });
                                             }
                                         } else if let Some(ev) = finalize_multiline(&info) {
-                                            if out.send(ev).await.is_err() { return; }
+                                            if out.send(ev).is_err() { return; }
                                         } else if let Some(text) = batch_summary(&info) {
-                                            let _ = out.send(Event::Notice { from: "*".into(), text, meta: MsgMeta::default() }).await;
+                                            let _ = out.send(Event::Notice { from: "*".into(), text, meta: MsgMeta::default() });
                                         }
                                     }
                                 }
@@ -304,7 +313,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                                 continue;
                             }
                             for ev in translate(msg, &batches, &mut isupport) {
-                                if out.send(ev).await.is_err() { return; }
+                                if out.send(ev).is_err() { return; }
                             }
                         }
                         Some(Err(e)) => break 'attempt AttemptOutcome::Recoverable(e.to_string()),
@@ -399,7 +408,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                             Some(Outgoing::Quit(reason)) => {
                                 diag_log(&cfg.name, &format!("QUIT requested (reason={reason:?})"));
                                 let _ = sender.send(Command::QUIT(reason));
-                                let _ = out.send(Event::Disconnected).await;
+                                let _ = out.send(Event::Disconnected);
                                 return;
                             }
                             None => {
@@ -415,7 +424,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
         match outcome {
             AttemptOutcome::Fatal(e) => {
                 diag_log(&cfg.name, &format!("FATAL: {e}"));
-                let _ = out.send(Event::ConnectError(e)).await;
+                let _ = out.send(Event::ConnectError(e));
                 return;
             }
             AttemptOutcome::Recoverable(e) => {
@@ -427,9 +436,8 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::Sender<Event>, mut orx: mpsc::Re
                         from: "*".into(),
                         text: format!("disconnected: {e} — reconnecting in {secs}s"),
                         meta: MsgMeta::default(),
-                    })
-                    .await;
-                let _ = out.send(Event::Reconnecting { in_secs: secs }).await;
+                    });
+                let _ = out.send(Event::Reconnecting { in_secs: secs });
                 tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
             }
         }

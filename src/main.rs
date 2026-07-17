@@ -161,7 +161,10 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
             }
         }
         // Per-worker channel, bridged into the shared channel tagged with id.
-        let (wtx, mut wrx) = mpsc::channel::<IrcEvent>(256);
+        // Unbounded so the worker can never block on a full queue and stall its
+        // socket (missing PONGs → ping-timeout disconnects). The bridge task
+        // below is the one that waits on the bounded UI channel instead.
+        let (wtx, mut wrx) = mpsc::unbounded_channel::<IrcEvent>();
         let out = irc::spawn_network(&net_cfg, wtx);
         let tx = tick_tx.clone();
         tokio::spawn(async move {

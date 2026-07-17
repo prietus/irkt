@@ -124,6 +124,17 @@ impl App {
                 // Membership is unknown while offline; clear it so the fresh NAMES
                 // after reconnect rebuilds it instead of stacking on a stale roster.
                 self.networks[ni].members.clear();
+                // Drop every buffer's history latch: whatever is said while we're
+                // offline is a gap, and the latch would otherwise suppress the
+                // CHATHISTORY LATEST refetch that backfills it after reconnect
+                // (this was the "random missing messages" bug — the gap stayed
+                // missing forever). In-flight staging is stale too; drop it.
+                for b in &mut self.networks[ni].buffers {
+                    b.history_loaded = false;
+                    b.history_loading = false;
+                    b.history_stage.clear();
+                    b.history_stage_oldest_ts = None;
+                }
                 self.networks[ni].status_mut().push(Line::system("disconnected"));
             }
             Event::Reconnecting { in_secs } => {
@@ -525,6 +536,32 @@ impl App {
                 reply_to = Some(parent);
             }
         }
+        // Optimistic local echo reconciliation: our own outgoing message is
+        // rendered the moment we send it (see send_message); the server's
+        // echo-message copy then *adopts* that line — filling in the msgid and
+        // server time — instead of rendering a duplicate.
+        if is_self && meta.batch_kind.is_none() {
+            let buf = &mut self.networks[ni].buffers[bi];
+            if let Some(l) = buf.lines.iter_mut().rev().take(50).find(|l| {
+                l.msgid.is_none()
+                    && l.text == body
+                    && match l.kind {
+                        LineKind::Self_ => true,
+                        LineKind::Action => action && l.from.eq_ignore_ascii_case(nick),
+                        _ => false,
+                    }
+            }) {
+                l.msgid = meta.msgid.clone();
+                if let Some(t) = &meta.server_time_hhmm {
+                    l.time = t.clone();
+                }
+                l.ts_iso = meta.server_time_iso.clone();
+                if l.reply_to.is_none() {
+                    l.reply_to = reply_to;
+                }
+                return;
+            }
+        }
         let line = Line {
             time: meta.server_time_hhmm.clone().unwrap_or_default(),
             kind: if is_self {
@@ -674,21 +711,45 @@ impl App {
         buf.history_loading = false;
         let staged = std::mem::take(&mut buf.history_stage);
         let oldest = buf.history_stage_oldest_ts.take();
-        if staged.len() < HISTORY_LIMIT as usize {
+        // Does this page extend the *older* end of what we hold (initial load or
+        // a BEFORE page)? Only then does a short page mean the server has no
+        // older history. A LATEST refetch after a reconnect covers the offline
+        // gap instead — a small gap must not mark the scrollback exhausted, nor
+        // drag the BEFORE-paging anchor forward in time.
+        let extends_older = match (&oldest, &buf.oldest_history_ts) {
+            (Some(o), Some(cur)) => o.as_str() < cur.as_str(),
+            (Some(_), None) => true,
+            (None, _) => buf.oldest_history_ts.is_none(),
+        };
+        if staged.len() < HISTORY_LIMIT as usize && extends_older {
             buf.history_exhausted = true;
         }
         if staged.is_empty() {
             return;
         }
-        if oldest.is_some() {
+        if extends_older && oldest.is_some() {
             buf.oldest_history_ts = oldest;
         }
-        // Prepend: staged (older) first, then the existing lines. Scroll is left
-        // untouched — it's measured from the bottom, so the visible region stays
-        // put, and the user simply gains scrollback above.
-        let mut combined = staged;
-        combined.append(&mut buf.lines);
-        buf.lines = combined;
+        // Insert the page as one block at its chronological position: right
+        // after the last existing line provably not newer than the page's
+        // newest message. Lines without a timestamp (local echo, join notices)
+        // never anchor the split — they are live-created, so they sort after
+        // any history. For the initial load and BEFORE pages the split lands at
+        // the top (the old prepend); for a post-reconnect LATEST refetch it
+        // lands just past the pre-disconnect lines — backfilling the offline
+        // gap in place instead of misfiling it at the top of the scrollback.
+        // Scroll is measured from the bottom, so a top insert leaves the
+        // visible region put.
+        let newest = staged.iter().rev().find_map(|l| l.ts_iso.as_deref().map(str::to_owned));
+        let at = match &newest {
+            Some(ts) => buf
+                .lines
+                .iter()
+                .rposition(|l| l.ts_iso.as_deref().is_some_and(|t| t <= ts.as_str()))
+                .map_or(0, |i| i + 1),
+            None => 0,
+        };
+        buf.lines.splice(at..at, staged);
     }
 
     /// Submit the current input line. Returns false on no-op.
@@ -737,20 +798,21 @@ impl App {
         if self.networks[ni].caps.iter().any(|c| c == "echo-message") {
             self.networks[ni]
                 .pending_replies
-                .push((target.to_lowercase(), text, parent));
-        } else {
-            let nick = self.networks[ni].nick.clone();
-            self.networks[ni].buffers[bi].push(Line {
-                time: String::new(),
-                kind: LineKind::Self_,
-                from: nick,
-                text,
-                msgid: None,
-                highlight: false,
-                reply_to: Some(parent),
-                ts_iso: None,
-            });
+                .push((target.to_lowercase(), text.clone(), parent.clone()));
         }
+        // Optimistic local echo, always (see send_message); the echo-message
+        // copy reconciles into this line rather than duplicating it.
+        let nick = self.networks[ni].nick.clone();
+        self.networks[ni].buffers[bi].push(Line {
+            time: String::new(),
+            kind: LineKind::Self_,
+            from: nick,
+            text,
+            msgid: None,
+            highlight: false,
+            reply_to: Some(parent),
+            ts_iso: None,
+        });
         // Drop the selection once we've replied.
         if let Some(b) = self.active_buffer_mut() {
             b.selection = None;
@@ -768,21 +830,23 @@ impl App {
         let _ = self.networks[ni]
             .out
             .try_send(Outgoing::Privmsg { target: target.clone(), text: text.clone() });
-        // If the server echoes our message (echo-message), it'll arrive as a
-        // PRIVMSG from us; otherwise render it locally now.
-        if !self.networks[ni].caps.iter().any(|c| c == "echo-message") {
-            let bi = self.active.buf;
-            self.networks[ni].buffers[bi].push(Line {
-                time: String::new(),
-                kind: LineKind::Self_,
-                from: our_nick,
-                text,
-                msgid: None,
-                highlight: false,
-                reply_to: None,
-                ts_iso: None,
-            });
-        }
+        // Optimistic local echo, always. Waiting for the server's echo-message
+        // copy meant a full round-trip before your own line appeared — and
+        // *nothing at all* if the send was queued/dropped mid-reconnect ("I
+        // typed and it never showed up"). Render now; when the echo arrives,
+        // handle_msg adopts its msgid/server-time into this line instead of
+        // rendering a duplicate.
+        let bi = self.active.buf;
+        self.networks[ni].buffers[bi].push(Line {
+            time: String::new(),
+            kind: LineKind::Self_,
+            from: our_nick,
+            text,
+            msgid: None,
+            highlight: false,
+            reply_to: None,
+            ts_iso: None,
+        });
     }
 
     /// React with `emoji` to the selected message (or the last one if none is
@@ -1184,6 +1248,88 @@ mod tests {
         assert!(buf.history_exhausted); // 2 staged < HISTORY_LIMIT
     }
 
+    // With echo-message negotiated, your own message renders the moment you hit
+    // enter (optimistic echo); the server's echo then adopts that line — filling
+    // in msgid and server time — instead of rendering a duplicate.
+    #[test]
+    fn own_message_renders_immediately_and_echo_reconciles() {
+        let mut app = test_app();
+        app.networks[0].caps = vec!["echo-message".into()];
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.active = ActiveBuffer { net: 0, buf: bi };
+
+        app.input = "hola".into();
+        app.submit_input();
+        {
+            let buf = &app.networks[0].buffers[bi];
+            assert_eq!(buf.lines.len(), 1, "local echo is instant");
+            assert!(buf.lines[0].msgid.is_none());
+        }
+
+        // The server's echo-message copy arrives with msgid + server time.
+        app.apply_event(0, Event::Privmsg {
+            target: "#c".into(),
+            nick: "me".into(),
+            body: "hola".into(),
+            meta: MsgMeta {
+                msgid: Some("m1".into()),
+                server_time_hhmm: Some("12:34".into()),
+                server_time_iso: Some("2026-01-01T12:34:00.000Z".into()),
+                ..MsgMeta::default()
+            },
+        });
+        let buf = &app.networks[0].buffers[bi];
+        assert_eq!(buf.lines.len(), 1, "echo reconciled, not duplicated");
+        assert_eq!(buf.lines[0].msgid.as_deref(), Some("m1"));
+        assert_eq!(buf.lines[0].time, "12:34");
+        assert_eq!(buf.lines[0].ts_iso.as_deref(), Some("2026-01-01T12:34:00.000Z"));
+    }
+
+    // A disconnect resets every buffer's history latch, and the post-reconnect
+    // CHATHISTORY LATEST refetch slots the offline gap between the old lines and
+    // the live traffic that arrived since reconnecting — not at the top.
+    #[test]
+    fn reconnect_backfills_the_offline_gap_in_order() {
+        let mut app = test_app();
+        app.networks[0].caps = vec!["draft/chathistory".into()];
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        {
+            let buf = &mut app.networks[0].buffers[bi];
+            buf.history_loaded = true;
+            buf.history_exhausted = true;
+            buf.oldest_history_ts = Some("2026-01-01T09:00:00.000Z".into());
+        }
+        msg_at(&mut app, "#c", "2026-01-01T10:00:00.000Z", "old1", "before the drop");
+
+        app.apply_event(0, Event::Disconnected);
+        assert!(
+            !app.networks[0].buffers[bi].history_loaded,
+            "history latch reset on disconnect"
+        );
+
+        // Reconnected; a live line lands before the refetch returns.
+        app.apply_event(0, Event::Connected);
+        msg_at(&mut app, "#c", "2026-01-01T10:20:00.000Z", "new1", "after reconnect");
+
+        // The LATEST refetch replays the gap, overlapping what we already hold.
+        hist_msg(&mut app, "#c", "alice", "before the drop", "2026-01-01T10:00:00.000Z", "old1");
+        hist_msg(&mut app, "#c", "alice", "said while offline", "2026-01-01T10:10:00.000Z", "gap1");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#c".into() });
+
+        let buf = &app.networks[0].buffers[bi];
+        let texts: Vec<&str> = buf.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["before the drop", "said while offline", "after reconnect"],
+            "gap backfilled in place, dup dropped"
+        );
+        assert_eq!(
+            buf.oldest_history_ts.as_deref(),
+            Some("2026-01-01T09:00:00.000Z"),
+            "BEFORE-paging anchor untouched by a gap refetch"
+        );
+    }
+
     #[test]
     fn older_page_prepends_before_existing_history() {
         let mut app = test_app();
@@ -1399,7 +1545,8 @@ mod tests {
         });
         app.active = ActiveBuffer { net: 0, buf: bi };
 
-        // We reply; echo-message means we don't render locally, we wait.
+        // We reply; the local echo renders immediately, and pending_replies
+        // remembers the parent in case the server strips the tag on echo.
         app.run_command("reply my answer");
         assert_eq!(app.networks[0].pending_replies.len(), 1);
 
