@@ -36,7 +36,9 @@ const WANT_EXTRA_CAPS: &[&str] = &[
     // Tier-2 protocol plumbing:
     "cap-notify",
     "labeled-response",
-    "sts",
+    // NB: never REQ `sts` — the spec forbids it, and since CAP REQ is atomic a
+    // server that NAKs it would refuse every other cap in the request too. The
+    // policy is read from the LS value instead.
     // Tier-3 drafts:
     "draft/multiline",
     "draft/typing",
@@ -81,6 +83,15 @@ struct BatchInfo {
     kind: String,
     params: Vec<String>,
     chunks: Vec<MultilineChunk>,
+    /// The opening BATCH carried `draft/chathistory-end`: this page reaches
+    /// the start of the target's history.
+    history_end: bool,
+    /// Messages the server sent inside this batch (chathistory only), before
+    /// any client-side dedup — a full page means there may be more.
+    count: u32,
+    /// Latest `time` tag seen in this batch: the anchor for the next
+    /// `CHATHISTORY AFTER` page.
+    newest_ts: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +119,8 @@ struct CapState {
     values: HashMap<String, String>,
     ls_complete: bool,
     acked: HashSet<String>,
+    /// Set once a NAKed REQ has been retried with `sasl` alone.
+    nak_retried: bool,
 }
 
 /// Spawn a worker for one network. Returns the sender the UI uses to issue
@@ -285,20 +298,51 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx:
                                     continue;
                                 }
                             }
+                            // Count every message the server puts in a chathistory
+                            // batch (events too, under event-playback): the page
+                            // limit applies to those, not to what survives dedup.
+                            if let Some(id) = msg.tags.as_ref().and_then(|tags| {
+                                tags.iter().find(|t| t.0 == "batch").and_then(|t| t.1.clone())
+                            }) {
+                                if let Some(info) = batches.get_mut(&id) {
+                                    if info.kind == "chathistory" {
+                                        info.count += 1;
+                                        let time = msg.tags.as_ref().and_then(|tags| {
+                                            tags.iter().find(|t| t.0 == "time").and_then(|t| t.1.clone())
+                                        });
+                                        if let Some(t) = time {
+                                            if info.newest_ts.as_deref().is_none_or(|n| t.as_str() > n) {
+                                                info.newest_ts = Some(t);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             // Intercept BATCH for netsplit/netjoin grouping + multiline.
                             if let Command::BATCH(ref tag_with_sign, ref sub, ref params) = msg.command {
                                 if let Some(id) = tag_with_sign.strip_prefix('+') {
                                     let kind = sub.as_ref().map(|s| s.to_str().to_ascii_lowercase()).unwrap_or_default();
+                                    let history_end = msg.tags.as_ref().is_some_and(|tags| {
+                                        tags.iter().any(|t| t.0 == "draft/chathistory-end")
+                                    });
                                     batches.insert(id.to_string(), BatchInfo {
                                         kind,
                                         params: params.clone().unwrap_or_default(),
                                         chunks: Vec::new(),
+                                        history_end,
+                                        count: 0,
+                                        newest_ts: None,
                                     });
                                 } else if let Some(id) = tag_with_sign.strip_prefix('-') {
                                     if let Some(info) = batches.remove(id) {
                                         if info.kind == "chathistory" {
                                             if let Some(target) = info.params.first() {
-                                                let _ = out.send(Event::ChatHistoryBatchEnd { target: target.clone() });
+                                                let _ = out.send(Event::ChatHistoryBatchEnd {
+                                                    target: target.clone(),
+                                                    end_of_history: info.history_end,
+                                                    count: info.count,
+                                                    newest_ts: info.newest_ts.clone(),
+                                                });
                                             }
                                         } else if let Some(ev) = finalize_multiline(&info) {
                                             if out.send(ev).is_err() { return; }
@@ -343,6 +387,9 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx:
                             }
                             Some(Outgoing::ChatHistoryBefore { target, before_ts, limit }) => {
                                 let _ = sender.send(Command::Raw("CHATHISTORY".into(), vec!["BEFORE".into(), target, format!("timestamp={before_ts}"), limit.to_string()]));
+                            }
+                            Some(Outgoing::ChatHistoryAfter { target, after_ts, limit }) => {
+                                let _ = sender.send(Command::Raw("CHATHISTORY".into(), vec!["AFTER".into(), target, format!("timestamp={after_ts}"), limit.to_string()]));
                             }
                             Some(Outgoing::ChatHistoryTargets { from_ts, to_ts, limit }) => {
                                 let _ = sender.send(Command::Raw("CHATHISTORY".into(), vec!["TARGETS".into(), format!("timestamp={from_ts}"), format!("timestamp={to_ts}"), limit.to_string()]));
@@ -638,6 +685,16 @@ fn handle_auth_msg(
         }
         Command::CAP(_, sub, _, _) if *sub == CapSubCommand::NAK => {
             if use_sasl {
+                // CAP REQ is atomic: one cap the server dislikes refuses the
+                // whole set. Retry once with just `sasl` so authentication
+                // still works (losing the extras) instead of failing outright.
+                if !caps.nak_retried && *phase == AuthPhase::AwaitingCapAck {
+                    caps.nak_retried = true;
+                    if let Err(e) = sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some("sasl".into()))) {
+                        return AuthOutcome::Failed(format!("send CAP REQ: {e}"));
+                    }
+                    return AuthOutcome::Pending;
+                }
                 AuthOutcome::Failed("server refused SASL capability".into())
             } else {
                 AuthOutcome::NeedIdentify
@@ -1056,7 +1113,15 @@ fn translate(
                 }
             }
             if let Some(text) = format_standard_reply(cmd, args) {
-                return vec![Event::Notice { from: "*".into(), text, meta }];
+                let mut evs = vec![Event::Notice { from: "*".into(), text, meta }];
+                // A refused CHATHISTORY request never opens a batch, so nothing
+                // else would end the buffer's "loading" state.
+                if cmd.eq_ignore_ascii_case("FAIL")
+                    && args.first().is_some_and(|c| c.eq_ignore_ascii_case("CHATHISTORY"))
+                {
+                    evs.push(Event::ChatHistoryFailed);
+                }
+                return evs;
             }
             if cmd.eq_ignore_ascii_case("CHATHISTORY")
                 && args.first().map(|s| s.eq_ignore_ascii_case("TARGETS")).unwrap_or(false)

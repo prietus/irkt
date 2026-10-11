@@ -140,6 +140,13 @@ pub struct Buffer {
     /// Set by the renderer when the viewport is scrolled to the very top, so the
     /// main loop can fetch an older page. Cleared once acted on.
     pub request_older: bool,
+    /// Server time of the newest line held when the connection dropped. After
+    /// reconnecting, the gap is fetched with `CHATHISTORY AFTER` this, paging
+    /// forward while pages come back full.
+    pub catchup_from: Option<String>,
+    /// Catch-up pages fetched so far this reconnect; non-zero while one is in
+    /// flight (its batch then isn't an initial/scroll-up page).
+    pub catchup_pages: u8,
 }
 
 impl Buffer {
@@ -164,6 +171,8 @@ impl Buffer {
             history_loading: false,
             history_exhausted: false,
             request_older: false,
+            catchup_from: None,
+            catchup_pages: 0,
         }
     }
 
@@ -305,6 +314,10 @@ pub struct Network {
     /// `reply_to` locally if the server doesn't echo the `+draft/reply` tag
     /// back (some networks strip client-only tags). (target_lc, text, parent_msgid).
     pub pending_replies: Vec<(String, String, String)>,
+    /// The server has sent `draft/chathistory-end` at least once. From then on
+    /// only that tag (or an empty page) ends history; a short page doesn't,
+    /// since servers like Ergo return short pages mid-history.
+    pub history_end_tag_seen: bool,
 }
 
 impl Network {
@@ -323,6 +336,7 @@ impl Network {
             members: std::collections::HashMap::new(),
             online_buddies: std::collections::HashSet::new(),
             pending_replies: Vec::new(),
+            history_end_tag_seen: false,
         }
     }
 

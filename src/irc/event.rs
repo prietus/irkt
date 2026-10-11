@@ -98,6 +98,8 @@ pub enum Outgoing {
     Nick(String),
     ChatHistoryLatest { target: String, limit: u32 },
     ChatHistoryBefore { target: String, before_ts: String, limit: u32 },
+    /// Reconnect catch-up: the page of messages newer than `after_ts`.
+    ChatHistoryAfter { target: String, after_ts: String, limit: u32 },
     ChatHistoryTargets { from_ts: String, to_ts: String, limit: u32 },
     Whois(String),
     Away(Option<String>),
@@ -162,7 +164,19 @@ pub enum Event {
     },
     UserLeft { channel: String, nick: String, meta: MsgMeta },
     UserQuit { nick: String, reason: Option<String>, meta: MsgMeta },
-    ChatHistoryBatchEnd { target: String },
+    /// A `chathistory` batch closed. `end_of_history` is set when the opening
+    /// BATCH carried `draft/chathistory-end`; `count` is how many messages the
+    /// server put in it (before client-side dedup), `newest_ts` the latest
+    /// `time` tag among them.
+    ChatHistoryBatchEnd {
+        target: String,
+        end_of_history: bool,
+        count: u32,
+        newest_ts: Option<String>,
+    },
+    /// `FAIL CHATHISTORY …`: the request was refused. FAIL doesn't name the
+    /// target, so every buffer with a request in flight is released.
+    ChatHistoryFailed,
     NickChanged { old: String, new: String, meta: MsgMeta },
     Names { channel: String, members: Vec<MemberEntry> },
     /// One RPL_WHOREPLY (352) row: annotates a known member with their bot and

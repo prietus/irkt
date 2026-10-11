@@ -9,6 +9,9 @@ use crate::irc::{Event, MsgMeta, Outgoing, TypingState};
 const NICK_ACTIVITY_WINDOW: usize = 200;
 /// How many messages to request per CHATHISTORY page (LATEST and BEFORE).
 const HISTORY_LIMIT: u32 = 50;
+/// Reconnect catch-up pages (`CHATHISTORY AFTER`) before giving up on the gap
+/// and jumping to the latest page.
+const CATCHUP_MAX_PAGES: u8 = 10;
 
 /// True when an event arrived inside a chathistory batch — i.e. it is replayed
 /// history (draft/chathistory + draft/event-playback), not a live event. Such
@@ -130,6 +133,13 @@ impl App {
                 // (this was the "random missing messages" bug — the gap stayed
                 // missing forever). In-flight staging is stale too; drop it.
                 for b in &mut self.networks[ni].buffers {
+                    // Remember where the scrollback stops so the refetch can
+                    // page forward through the whole gap. An anchor still set
+                    // means the buffer never fetched its previous gap: keep it.
+                    if b.catchup_from.is_none() {
+                        b.catchup_from = b.latest_ts();
+                    }
+                    b.catchup_pages = 0;
                     b.history_loaded = false;
                     b.history_loading = false;
                     b.history_stage.clear();
@@ -461,7 +471,24 @@ impl App {
                     *rm = Some(ts);
                 }
             }
-            Event::ChatHistoryBatchEnd { target } => self.finish_history_batch(ni, &target),
+            Event::ChatHistoryBatchEnd { target, end_of_history, count, newest_ts } => {
+                self.finish_history_batch(ni, &target, end_of_history, count, newest_ts)
+            }
+            Event::ChatHistoryFailed => {
+                // Release every in-flight request and stop paging those buffers:
+                // otherwise they show "loading" forever, or — once scrolled to
+                // the top — re-send the refused request on every redraw.
+                for b in &mut self.networks[ni].buffers {
+                    if b.history_loading {
+                        b.history_loading = false;
+                        b.catchup_pages = 0;
+                        b.catchup_from = None;
+                        b.history_exhausted = true;
+                        b.history_stage.clear();
+                        b.history_stage_oldest_ts = None;
+                    }
+                }
+            }
             Event::Presence { nicks, online } => {
                 let net = &mut self.networks[ni];
                 for n in nicks {
@@ -583,12 +610,26 @@ impl App {
         // not bump unread, clear typing, or count as a live mention.
         if meta.batch_kind.as_deref() == Some("chathistory") {
             let buf = &mut self.networks[ni].buffers[bi];
-            if let Some(id) = &line.msgid {
-                let dup = buf.lines.iter().any(|l| l.msgid.as_deref() == Some(id))
-                    || buf.history_stage.iter().any(|l| l.msgid.as_deref() == Some(id));
-                if dup {
-                    return;
+            let dup = match (&line.msgid, &line.ts_iso) {
+                (Some(id), _) => {
+                    buf.lines.iter().any(|l| l.msgid.as_deref() == Some(id))
+                        || buf.history_stage.iter().any(|l| l.msgid.as_deref() == Some(id))
                 }
+                // No msgid (some bouncers, e.g. soju, omit it): fall back to
+                // server time + sender + text, or the post-reconnect LATEST
+                // refetch splices in a second copy of the overlap.
+                (None, Some(ts)) => {
+                    let same = |l: &Line| {
+                        l.ts_iso.as_deref() == Some(ts.as_str())
+                            && l.from.eq_ignore_ascii_case(&line.from)
+                            && l.text == line.text
+                    };
+                    buf.lines.iter().any(same) || buf.history_stage.iter().any(same)
+                }
+                (None, None) => false,
+            };
+            if dup {
+                return;
             }
             if buf.history_stage.is_empty() {
                 buf.history_stage_oldest_ts = meta.server_time_iso.clone();
@@ -632,6 +673,17 @@ impl App {
         buf.history_loaded = true;
         buf.history_loading = true;
         let target = buf.name.clone();
+        // After a reconnect, fetch the offline gap forward from the last line
+        // we held; LATEST alone would leave a hole if more than a page was said.
+        if let Some(after_ts) = buf.catchup_from.take() {
+            buf.catchup_pages = 1;
+            let _ = net.out.try_send(Outgoing::ChatHistoryAfter {
+                target,
+                after_ts,
+                limit: HISTORY_LIMIT,
+            });
+            return;
+        }
         let _ = net.out.try_send(Outgoing::ChatHistoryLatest {
             target,
             limit: HISTORY_LIMIT,
@@ -702,8 +754,18 @@ impl App {
     /// Finalize an open `chathistory` batch: prepend the staged messages (in
     /// chronological order) ahead of the buffer's existing lines, advance the
     /// paging anchor, and mark exhaustion when the server returned a short page.
-    fn finish_history_batch(&mut self, ni: usize, target: &str) {
+    fn finish_history_batch(
+        &mut self,
+        ni: usize,
+        target: &str,
+        end_of_history: bool,
+        count: u32,
+        page_newest: Option<String>,
+    ) {
         let net = &mut self.networks[ni];
+        net.history_end_tag_seen |= end_of_history;
+        let end_tag_seen = net.history_end_tag_seen;
+        let out = net.out.clone();
         let Some(bi) = net.find_buffer(target) else {
             return;
         };
@@ -716,13 +778,48 @@ impl App {
         // older history. A LATEST refetch after a reconnect covers the offline
         // gap instead — a small gap must not mark the scrollback exhausted, nor
         // drag the BEFORE-paging anchor forward in time.
-        let extends_older = match (&oldest, &buf.oldest_history_ts) {
-            (Some(o), Some(cur)) => o.as_str() < cur.as_str(),
-            (Some(_), None) => true,
-            (None, _) => buf.oldest_history_ts.is_none(),
-        };
-        if staged.len() < HISTORY_LIMIT as usize && extends_older {
+        // A reconnect catch-up (AFTER) page never does.
+        let catchup = buf.catchup_pages > 0;
+        let extends_older = !catchup
+            && match (&oldest, &buf.oldest_history_ts) {
+                (Some(o), Some(cur)) => o.as_str() < cur.as_str(),
+                (Some(_), None) => true,
+                (None, _) => buf.oldest_history_ts.is_none(),
+            };
+        // `count` is what the server sent, before dedup: a full page may
+        // shrink to a few new lines here without meaning anything ran out.
+        let full_page = count >= HISTORY_LIMIT && !end_of_history;
+        // The server's `draft/chathistory-end` (or an empty page) is
+        // authoritative; servers that never send the tag fall back to "a short
+        // page means the start of history".
+        let reached_start = end_of_history || count == 0 || (!end_tag_seen && !full_page);
+        if reached_start && extends_older {
             buf.history_exhausted = true;
+        }
+        if catchup {
+            match page_newest.filter(|_| full_page) {
+                // More was said while offline: keep paging forward.
+                Some(after_ts) if buf.catchup_pages < CATCHUP_MAX_PAGES => {
+                    buf.catchup_pages += 1;
+                    buf.history_loading = true;
+                    let _ = out.try_send(Outgoing::ChatHistoryAfter {
+                        target: buf.name.clone(),
+                        after_ts,
+                        limit: HISTORY_LIMIT,
+                    });
+                }
+                // Too far behind to page through: jump to the latest page
+                // (it splices in chronologically, past what we just got).
+                Some(_) => {
+                    buf.catchup_pages = 0;
+                    buf.history_loading = true;
+                    let _ = out.try_send(Outgoing::ChatHistoryLatest {
+                        target: buf.name.clone(),
+                        limit: HISTORY_LIMIT,
+                    });
+                }
+                None => buf.catchup_pages = 0,
+            }
         }
         if staged.is_empty() {
             return;
@@ -1238,7 +1335,7 @@ mod tests {
         hist_msg(&mut app, "#rust", "carol", "live", "t3", "C"); // dup msgid
         // Nothing committed until the batch closes.
         assert_eq!(app.networks[0].buffers[bi].lines.len(), 1);
-        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#rust".into() });
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#rust".into(), end_of_history: false, count: 3, newest_ts: None });
 
         let buf = &app.networks[0].buffers[bi];
         let texts: Vec<&str> = buf.lines.iter().map(|l| l.text.as_str()).collect();
@@ -1314,7 +1411,7 @@ mod tests {
         // The LATEST refetch replays the gap, overlapping what we already hold.
         hist_msg(&mut app, "#c", "alice", "before the drop", "2026-01-01T10:00:00.000Z", "old1");
         hist_msg(&mut app, "#c", "alice", "said while offline", "2026-01-01T10:10:00.000Z", "gap1");
-        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#c".into() });
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#c".into(), end_of_history: false, count: 2, newest_ts: None });
 
         let buf = &app.networks[0].buffers[bi];
         let texts: Vec<&str> = buf.lines.iter().map(|l| l.text.as_str()).collect();
@@ -1335,15 +1432,61 @@ mod tests {
         let mut app = test_app();
         let bi = app.networks[0].ensure_buffer("#rust", BufferKind::Channel);
         hist_msg(&mut app, "#rust", "a", "mid", "t5", "M");
-        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#rust".into() });
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#rust".into(), end_of_history: false, count: 1, newest_ts: None });
         // A BEFORE page brings an older message.
         hist_msg(&mut app, "#rust", "a", "old", "t1", "O");
-        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#rust".into() });
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#rust".into(), end_of_history: false, count: 1, newest_ts: None });
 
         let buf = &app.networks[0].buffers[bi];
         let texts: Vec<&str> = buf.lines.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, vec!["old", "mid"]);
         assert_eq!(buf.oldest_history_ts.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn history_without_msgid_dedupes_on_time_nick_text() {
+        let mut app = test_app();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        let no_id = |iso: &str| MsgMeta { msgid: None, ..hist_meta(iso, "") };
+        let say = |app: &mut App, nick: &str, body: &str, iso: &str| {
+            app.apply_event(0, Event::Privmsg {
+                target: "#c".into(), nick: nick.into(), body: body.into(), meta: no_id(iso),
+            });
+        };
+        say(&mut app, "alice", "hi", "2026-01-01T10:00:00.000Z");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#c".into(), end_of_history: false, count: 1, newest_ts: None });
+        // A reconnect refetch replays the same line (no msgid) plus a new one;
+        // a same-text line at another time is a different message.
+        say(&mut app, "alice", "hi", "2026-01-01T10:00:00.000Z");
+        say(&mut app, "alice", "hi", "2026-01-01T10:05:00.000Z");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#c".into(), end_of_history: false, count: 2, newest_ts: None });
+        assert_eq!(app.networks[0].buffers[bi].lines.len(), 2);
+    }
+
+    #[test]
+    fn end_tag_is_authoritative_once_seen() {
+        let mut app = test_app();
+        let a = app.networks[0].ensure_buffer("#a", BufferKind::Channel);
+        let b = app.networks[0].ensure_buffer("#b", BufferKind::Channel);
+        // Without the tag a short page still means the start of history.
+        hist_msg(&mut app, "#a", "x", "one", "t1", "A1");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#a".into(), end_of_history: true, count: 1, newest_ts: None });
+        assert!(app.networks[0].buffers[a].history_exhausted);
+        // Once the server has sent the tag, an untagged short page doesn't.
+        hist_msg(&mut app, "#b", "x", "one", "t1", "B1");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#b".into(), end_of_history: false, count: 1, newest_ts: None });
+        assert!(!app.networks[0].buffers[b].history_exhausted);
+    }
+
+    #[test]
+    fn fail_chathistory_releases_loading_buffers() {
+        let mut app = test_app();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.networks[0].buffers[bi].history_loading = true;
+        app.apply_event(0, Event::ChatHistoryFailed);
+        let buf = &app.networks[0].buffers[bi];
+        assert!(!buf.history_loading);
+        assert!(buf.history_exhausted, "a refused request must not be re-sent on every redraw");
     }
 
     #[test]
@@ -1724,6 +1867,102 @@ mod tests {
         std::mem::forget(_r);
         app.networks.push(Network::new(0, cfg, out));
         (app, out_rx)
+    }
+
+    /// Drop and reconnect a network whose `#c` holds a message at 10:00, then
+    /// let the self-join request its history.
+    fn reconnect_with_history() -> (App, mpsc::Receiver<Outgoing>, usize) {
+        let (mut app, out_rx) = app_with_outbox();
+        app.networks[0].caps = vec!["draft/chathistory".into()];
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        msg_at(&mut app, "#c", "2026-01-01T10:00:00.000Z", "old1", "before the drop");
+        app.apply_event(0, Event::Disconnected);
+        app.apply_event(0, Event::Connected);
+        app.apply_event(0, Event::UserJoined {
+            channel: "#c".into(), nick: "me".into(),
+            userhost: None, account: None, realname: None, meta: meta(),
+        });
+        (app, out_rx, bi)
+    }
+
+    fn take_history_request(out_rx: &mut mpsc::Receiver<Outgoing>) -> Option<Outgoing> {
+        std::iter::from_fn(|| out_rx.try_recv().ok()).find(|o| {
+            matches!(o, Outgoing::ChatHistoryAfter { .. } | Outgoing::ChatHistoryLatest { .. })
+        })
+    }
+
+    #[test]
+    fn reconnect_catches_up_with_after_from_the_last_line() {
+        let (app, mut out_rx, bi) = reconnect_with_history();
+        match take_history_request(&mut out_rx) {
+            Some(Outgoing::ChatHistoryAfter { target, after_ts, .. }) => {
+                assert_eq!(target, "#c");
+                assert_eq!(after_ts, "2026-01-01T10:00:00.000Z");
+            }
+            _ => panic!("expected CHATHISTORY AFTER"),
+        }
+        let buf = &app.networks[0].buffers[bi];
+        assert_eq!(buf.catchup_pages, 1);
+        assert!(buf.catchup_from.is_none(), "anchor consumed by the request");
+    }
+
+    #[test]
+    fn full_catchup_page_requests_the_next_one() {
+        let (mut app, mut out_rx, bi) = reconnect_with_history();
+        assert!(take_history_request(&mut out_rx).is_some());
+        assert_eq!(app.networks[0].buffers[bi].catchup_pages, 1);
+        hist_msg(&mut app, "#c", "bob", "gap", "2026-01-01T10:10:00.000Z", "g1");
+        app.apply_event(0, Event::ChatHistoryBatchEnd {
+            target: "#c".into(),
+            end_of_history: false,
+            count: HISTORY_LIMIT,
+            newest_ts: Some("2026-01-01T10:30:00.000Z".into()),
+        });
+        match take_history_request(&mut out_rx) {
+            Some(Outgoing::ChatHistoryAfter { after_ts, .. }) => {
+                assert_eq!(after_ts, "2026-01-01T10:30:00.000Z", "pages from the page's newest message");
+            }
+            _ => panic!("expected the next AFTER page"),
+        }
+        let buf = &app.networks[0].buffers[bi];
+        assert_eq!(buf.catchup_pages, 2);
+        assert!(buf.history_loading);
+        assert!(!buf.history_exhausted, "a catch-up page never ends scroll-back");
+    }
+
+    #[test]
+    fn short_catchup_page_ends_the_catchup() {
+        let (mut app, mut out_rx, bi) = reconnect_with_history();
+        assert!(take_history_request(&mut out_rx).is_some());
+        hist_msg(&mut app, "#c", "bob", "gap", "2026-01-01T10:10:00.000Z", "g1");
+        app.apply_event(0, Event::ChatHistoryBatchEnd {
+            target: "#c".into(),
+            end_of_history: false,
+            count: 1,
+            newest_ts: Some("2026-01-01T10:10:00.000Z".into()),
+        });
+        assert!(take_history_request(&mut out_rx).is_none());
+        let buf = &app.networks[0].buffers[bi];
+        assert_eq!(buf.catchup_pages, 0);
+        assert!(!buf.history_loading);
+        assert!(!buf.history_exhausted);
+        let texts: Vec<&str> = buf.lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["before the drop", "gap"]);
+    }
+
+    #[test]
+    fn catchup_gives_up_after_max_pages_and_jumps_to_latest() {
+        let (mut app, mut out_rx, bi) = reconnect_with_history();
+        assert!(take_history_request(&mut out_rx).is_some());
+        app.networks[0].buffers[bi].catchup_pages = CATCHUP_MAX_PAGES;
+        app.apply_event(0, Event::ChatHistoryBatchEnd {
+            target: "#c".into(),
+            end_of_history: false,
+            count: HISTORY_LIMIT,
+            newest_ts: Some("2026-01-01T12:00:00.000Z".into()),
+        });
+        assert!(matches!(take_history_request(&mut out_rx), Some(Outgoing::ChatHistoryLatest { .. })));
+        assert_eq!(app.networks[0].buffers[bi].catchup_pages, 0);
     }
 
     #[test]
