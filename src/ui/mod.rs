@@ -24,7 +24,9 @@ const IMAGE_INDENT: u16 = 8;
 const CARD_THUMB_COLS: u16 = 22;
 const CARD_THUMB_MAX_ROWS: u16 = 6;
 
-pub fn draw(f: &mut Frame, app: &mut App) {
+/// Renders the whole UI and returns where the terminal cursor should sit (the
+/// input line), which the caller's [`crate::draw::Drawer`] applies after flushing.
+pub fn draw(f: &mut Frame, app: &mut App) -> Option<(u16, u16)> {
     let area = f.area();
     // Rows: main | input | statusbar.
     let rows = Layout::default()
@@ -73,8 +75,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         app.member_x = (0, 0);
     }
 
-    draw_input(f, input_row, app);
+    let cursor = draw_input(f, input_row, app);
     draw_status(f, status_row, app);
+    Some(cursor)
 }
 
 fn draw_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
@@ -366,9 +369,18 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     // Draw any images whose reserved rows are within the visible window.
+    let tmux = app.images.tmux;
     for (rstart, h, cols, url) in placements {
         let rend = rstart + h as usize;
         if rend <= start || rstart >= end {
+            continue;
+        }
+        // Only draw images that fit entirely. A clipped rect makes `Fit` shrink
+        // the whole image into it and re-encode it on every scroll step (a
+        // full PNG re-sent per wheel notch on iTerm2). Images taller than the
+        // chat pane can never fit, so those still render clipped.
+        let fits_pane = (h as usize) <= end - start;
+        if fits_pane && (rstart < start || rend > end) {
             continue;
         }
         let vis_top = rstart.max(start);
@@ -395,7 +407,40 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
                     f.render_stateful_widget(widget, rect, proto);
                 }
             }
+            Some(ImageState::Native { b64, len, escape, .. }) => {
+                if rect.width == 0 || rect.height == 0 {
+                    continue;
+                }
+                // Built once per size: the escape is the whole GIF, and an
+                // unchanged cell symbol is never re-sent (see crate::draw), so
+                // iTerm2 receives it once and plays it on its own.
+                let size = (rect.width, rect.height);
+                if escape.as_ref().is_none_or(|(s, _)| *s != size) {
+                    let seq = crate::images::iterm2_escape(b64, *len, size.0, size.1, tmux);
+                    *escape = Some((size, seq));
+                }
+                if let Some((_, seq)) = escape {
+                    place_escape(f.buffer_mut(), rect, seq);
+                }
+            }
             _ => {}
+        }
+    }
+}
+
+/// Put a self-drawing image escape in the top-left cell of `rect` and mark the
+/// rest of the area skipped, the way ratatui-image places its own: the
+/// terminal paints the image there, and ratatui leaves those cells alone.
+fn place_escape(buf: &mut ratatui::buffer::Buffer, rect: Rect, seq: &str) {
+    let rect = rect.intersection(buf.area);
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            let cell = &mut buf[(x, y)];
+            if (x, y) == (rect.x, rect.y) {
+                cell.set_symbol(seq);
+            } else {
+                cell.set_skip(true);
+            }
         }
     }
 }
@@ -478,8 +523,11 @@ fn push_message(
     if (ctx.inline || ctx.unfurl) && matches!(line.kind, LineKind::Message | LineKind::Self_) {
         for url in extract_urls(&line.text) {
             match ctx.images.map.get(&url) {
-                Some(ImageState::Ready { w, h, .. } | ImageState::Anim { w, h, .. })
-                    if ctx.inline =>
+                Some(
+                    ImageState::Ready { w, h, .. }
+                    | ImageState::Anim { w, h, .. }
+                    | ImageState::Native { w, h, .. },
+                ) if ctx.inline =>
                 {
                     let r = ctx.images.rows_for(*w, *h, ctx.img_cols);
                     let s = rows.len();
@@ -876,7 +924,7 @@ fn prefix_rank(prefixes: &str) -> u8 {
     }
 }
 
-fn draw_input(f: &mut Frame, area: Rect, app: &App) {
+fn draw_input(f: &mut Frame, area: Rect, app: &App) -> (u16, u16) {
     let t = &app.theme;
     let target = app.active_target().unwrap_or_default();
     // The author the current action targets: the selected message, or the most
@@ -936,7 +984,9 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
     // Cursor position: badge + prompt width + display width of input up to cursor.
     let before = &app.input[..app.cursor.min(app.input.len())];
     let cx = area.x + (badge_w + prompt_w + before.width()) as u16;
-    f.set_cursor_position((cx.min(area.x + area.width.saturating_sub(1)), area.y));
+    let pos = (cx.min(area.x + area.width.saturating_sub(1)), area.y);
+    f.set_cursor_position(pos);
+    pos
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
@@ -1051,7 +1101,7 @@ mod render_tests {
 
         let backend = TestBackend::new(70, 10);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
 
         let screen = buffer_to_string(&term);
         println!("\n===== RENDERED CHAT =====\n{screen}=========================");
@@ -1094,7 +1144,7 @@ mod render_tests {
 
         let backend = TestBackend::new(70, 10);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
 
         let screen = buffer_to_string(&term);
         println!("\n===== SELECTION + REPLY CHIP =====\n{screen}==================================");
@@ -1121,7 +1171,7 @@ mod render_tests {
         app.show_members = false;
         app.theme = theme;
         let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
         term
     }
 
@@ -1166,17 +1216,17 @@ mod render_tests {
 
         // No selection: the status bar shows the generic help line.
         let mut term = Terminal::new(TestBackend::new(90, 12)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
         assert!(buffer_to_string(&term).contains("^N/^P switch"), "generic help when nothing selected");
 
         // With a message selected, the hint replaces the help line.
         app.networks[0].buffers[bi].selection = Some("m1".into());
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
         assert!(buffer_to_string(&term).contains("type to reply"), "selection shows the reply/react hint");
 
         // In react mode, the hint switches to the emoji instruction.
         app.react_mode = true;
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
         assert!(buffer_to_string(&term).contains("insert an emoji"), "react mode shows the emoji hint");
     }
 
@@ -1203,7 +1253,7 @@ mod render_tests {
         app.show_members = false;
 
         let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
 
         // The selectable message got a clickable row; the system line did not.
         let &(y, ref mid) = app.chat_rows.first().expect("a selectable message row");
@@ -1245,7 +1295,7 @@ mod render_tests {
         app.show_members = true;
 
         let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
 
         // Each member got a clickable row inside the member panel's x-range.
         let &(y, ref nick) = app
@@ -1279,7 +1329,7 @@ mod render_tests {
         app.show_members = false;
 
         let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
 
         // The draw recorded a clickable row for #two; clicking it activates it.
         let &(y, net, buf) = app
@@ -1324,7 +1374,7 @@ mod render_tests {
         app.theme = theme.clone();
 
         let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
         let buf = term.backend().buffer();
         let area = *buf.area();
 
@@ -1395,7 +1445,7 @@ mod render_tests {
         app.show_members = false;
 
         let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
 
         // "#other" registered a clickable channel span.
         let (y, cs, _ce, _l) = app
@@ -1440,7 +1490,7 @@ mod render_tests {
         app.show_members = false;
 
         let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
         let screen = buffer_to_string(&term);
         let sep = screen.find("new messages").expect("separator label renders");
         let old = screen.find("old one").expect("read message renders");

@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod dict;
+mod draw;
 mod images;
 mod irc;
 mod keys;
@@ -253,7 +254,8 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
     drop(tick_tx);
 
     let mut term = setup_terminal(cfg.mouse)?;
-    term.draw(|f| ui::draw(f, &mut app))?;
+    let mut drawer = draw::Drawer::default();
+    drawer.draw(&mut term, |f| ui::draw(f, &mut app))?;
     let mut view = view_key(&app);
 
     loop {
@@ -350,16 +352,24 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         if !need_redraw {
             continue;
         }
-        // Inline images drawn with a terminal graphics protocol aren't erased by
-        // ratatui's cell diffing, so a scroll / buffer switch / panel toggle /
-        // resize would leave stale image pixels behind. Force a full clear on
-        // those view changes (only when graphics are actually on screen).
+        // Inline images drawn with a terminal graphics protocol aren't always
+        // erased by ratatui's cell diffing, so a scroll / buffer switch / panel
+        // toggle / resize could leave stale image pixels behind. Force a full
+        // clear on those view changes (only when graphics are actually on
+        // screen). iTerm2 images live in the cell grid and are overwritten by
+        // the text the diff sends, so a plain scroll there doesn't need the
+        // full-screen wipe that made every wheel notch flicker.
         let new_view = view_key(&app);
-        if (new_view != view || resized) && app.images.graphics_active() {
-            term.clear()?;
+        let changed = if app.images.is_iterm2() {
+            (new_view.0, new_view.1, new_view.3, new_view.4) != (view.0, view.1, view.3, view.4)
+        } else {
+            new_view != view
+        };
+        if (changed || resized) && app.images.graphics_active() {
+            drawer.clear(&mut term)?;
         }
         view = new_view;
-        term.draw(|f| ui::draw(f, &mut app))?;
+        drawer.draw(&mut term, |f| ui::draw(f, &mut app))?;
         // Backlog from a bouncer/server: fetch the active buffer's initial
         // history, and (after the draw decided we're at the top) older pages.
         app.maybe_load_active_history();

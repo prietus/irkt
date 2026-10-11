@@ -13,6 +13,11 @@ use tokio::sync::mpsc;
 
 /// Cap on downloaded image size to avoid decoding hostile payloads.
 const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+/// Largest GIF handed to iTerm2 as-is (see [`ImageState::Native`]); bigger
+/// ones are decoded into frames like on other terminals. The whole file sits
+/// base64-encoded in one cell, and the escape is re-sent whenever the image
+/// moves on screen.
+const MAX_NATIVE_BYTES: usize = 4 * 1024 * 1024;
 /// Cap on HTML we read when unfurling a link.
 const MAX_HTML_BYTES: usize = 256 * 1024;
 
@@ -30,7 +35,8 @@ pub enum ImageState {
     /// An animated GIF/WebP. Terminals don't self-animate inline images in the
     /// alternate screen (where a TUI lives), so we drive it ourselves: one
     /// prebuilt protocol per frame, and the render/main loop advances `idx` on a
-    /// timer (see `App::advance_anims`). Produced for any graphics protocol.
+    /// timer (see `App::advance_anims`). Produced for any graphics protocol,
+    /// except GIFs on iTerm2 (see [`ImageState::Native`]).
     Anim {
         frames: Vec<StatefulProtocol>,
         /// Per-frame display duration, parallel to `frames`.
@@ -40,6 +46,19 @@ pub enum ImageState {
         /// When the current frame should give way to the next.
         next_due: Instant,
         /// Pixel dimensions, used to reserve the right row count (as for `Ready`).
+        w: u32,
+        h: u32,
+    },
+    /// An animated GIF on iTerm2, which plays GIFs itself: the original file
+    /// goes out once in an `OSC 1337` escape instead of one PNG per frame, and
+    /// the frame clock leaves it alone.
+    Native {
+        /// The GIF, base64-encoded once.
+        b64: String,
+        /// Byte length of the original file (the escape's `size=`).
+        len: usize,
+        /// The escape built for the last render size, `(cols, rows)`.
+        escape: Option<((u16, u16), String)>,
         w: u32,
         h: u32,
     },
@@ -58,6 +77,8 @@ pub enum Fetched {
     Image(StatefulProtocol, u32, u32),
     /// An animated GIF/WebP: (per-frame protocols, per-frame delays, w, h).
     Anim(Vec<StatefulProtocol>, Vec<Duration>, u32, u32),
+    /// An animated GIF for iTerm2 to play itself: (base64 file, byte len, w, h).
+    Native(String, usize, u32, u32),
     Card { title: String, desc: String, host: String, image: Option<String> },
     Nothing,
 }
@@ -70,6 +91,8 @@ pub struct ImageMsg {
 
 pub struct Images {
     pub picker: Picker,
+    /// Running inside tmux: escapes we build ourselves need passthrough.
+    pub tmux: bool,
     pub map: HashMap<String, ImageState>,
     tx: mpsc::Sender<ImageMsg>,
     http: reqwest::Client,
@@ -81,7 +104,8 @@ impl Images {
             .user_agent(concat!("irkt/", env!("CARGO_PKG_VERSION")))
             .build()
             .unwrap_or_default();
-        Images { picker, map: HashMap::new(), tx, http }
+        let tmux = std::env::var_os("TMUX").is_some();
+        Images { picker, tmux, map: HashMap::new(), tx, http }
     }
 
     /// Kick off a fetch for `url` if we haven't seen it yet.
@@ -108,12 +132,18 @@ impl Images {
                     Instant::now() + delays.first().copied().unwrap_or(Duration::from_millis(100));
                 ImageState::Anim { frames, delays, idx: 0, next_due, w, h }
             }
+            Fetched::Native(b64, len, w, h) => ImageState::Native { b64, len, escape: None, w, h },
             Fetched::Card { title, desc, host, image } => {
                 ImageState::Card { title, desc, host, image }
             }
             Fetched::Nothing => ImageState::None,
         };
         self.map.insert(msg.url, st);
+    }
+
+    /// Whether images go out as iTerm2 `OSC 1337` escapes.
+    pub fn is_iterm2(&self) -> bool {
+        matches!(self.picker.protocol_type(), ratatui_image::picker::ProtocolType::Iterm2)
     }
 
     /// True when out-of-band terminal graphics (Kitty / iTerm2 / Sixel) are in
@@ -128,7 +158,9 @@ impl Images {
             && self
                 .map
                 .values()
-                .any(|s| matches!(s, ImageState::Ready { .. } | ImageState::Anim { .. }))
+                .any(|s| {
+                    matches!(s, ImageState::Ready { .. } | ImageState::Anim { .. } | ImageState::Native { .. })
+                })
     }
 
     /// Number of terminal rows an image of pixel size `w`×`h` needs when drawn
@@ -178,15 +210,7 @@ async fn fetch_inner(http: &reqwest::Client, picker: &Picker, url: &str) -> Resu
             }
         }
         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-        // On a graphics terminal, decode an animated GIF/WebP into frames we
-        // animate ourselves; everything else becomes a single static frame.
-        if is_graphics(picker)
-            && let Some((frames, delays, w, h)) = decode_animation(picker, bytes.to_vec()).await
-        {
-            return Ok(Fetched::Anim(frames, delays, w, h));
-        }
-        let (proto, w, h) = decode_image(picker, bytes.to_vec()).await?;
-        return Ok(Fetched::Image(proto, w, h));
+        return decode_media(picker, bytes.to_vec()).await;
     }
 
     if ct.starts_with("text/html") || ct.starts_with("application/xhtml") {
@@ -246,13 +270,8 @@ async fn fetch_inner(http: &reqwest::Client, picker: &Picker, url: &str) -> Resu
     let too_big = size.map_or(false, |s| s > MAX_IMAGE_BYTES);
     if ct_unknown && !too_big {
         let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-        if is_graphics(picker)
-            && let Some((frames, delays, w, h)) = decode_animation(picker, bytes.to_vec()).await
-        {
-            return Ok(Fetched::Anim(frames, delays, w, h));
-        }
-        if let Ok((proto, w, h)) = decode_image(picker, bytes.to_vec()).await {
-            return Ok(Fetched::Image(proto, w, h));
+        if let Ok(fetched) = decode_media(picker, bytes.to_vec()).await {
+            return Ok(fetched);
         }
     }
 
@@ -387,13 +406,70 @@ async fn decode_url_media(
         }
     }
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    decode_media(picker, bytes.to_vec()).await
+}
+
+/// Decode fetched image bytes. On iTerm2 an animated GIF is kept as the
+/// original file for the terminal to play; on other graphics terminals an
+/// animated GIF/WebP becomes frames we animate ourselves; everything else is a
+/// single still frame.
+async fn decode_media(picker: &Picker, bytes: Vec<u8>) -> Result<Fetched, String> {
+    if matches!(picker.protocol_type(), ratatui_image::picker::ProtocolType::Iterm2)
+        && bytes.len() <= MAX_NATIVE_BYTES
+    {
+        let probe = bytes.clone();
+        let dims = tokio::task::spawn_blocking(move || animated_gif_dims(&probe))
+            .await
+            .ok()
+            .flatten();
+        if let Some((w, h)) = dims {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            return Ok(Fetched::Native(b64, bytes.len(), w, h));
+        }
+    }
     if is_graphics(picker)
-        && let Some((frames, delays, w, h)) = decode_animation(picker, bytes.to_vec()).await
+        && let Some((frames, delays, w, h)) = decode_animation(picker, bytes.clone()).await
     {
         return Ok(Fetched::Anim(frames, delays, w, h));
     }
-    let (proto, w, h) = decode_image(picker, bytes.to_vec()).await?;
+    let (proto, w, h) = decode_image(picker, bytes).await?;
     Ok(Fetched::Image(proto, w, h))
+}
+
+/// Pixel dimensions of `bytes` if it is a GIF with at least two frames.
+fn animated_gif_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    use image::AnimationDecoder;
+    use image::ImageDecoder;
+    if !bytes.starts_with(b"GIF8") {
+        return None;
+    }
+    let dec = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes)).ok()?;
+    let dims = dec.dimensions();
+    let frames = dec.into_frames().take(2).filter(Result::is_ok).count();
+    (frames == 2).then_some(dims)
+}
+
+/// The iTerm2 escape that shows a whole image file (`b64`, `len` bytes)
+/// scaled into a `cols`×`rows` cell area at the cursor, without moving it.
+/// Like ratatui-image's own, it first erases the area (ECH per row) so stale
+/// text doesn't show through transparent pixels. Wrapped for tmux passthrough
+/// when `tmux`.
+pub fn iterm2_escape(b64: &str, len: usize, cols: u16, rows: u16, tmux: bool) -> String {
+    let (start, esc, end) = if tmux { ("\x1bPtmux;", "\x1b\x1b", "\x1b\\") } else { ("", "\x1b", "") };
+    let mut seq = String::with_capacity(b64.len() + 128);
+    seq.push_str(start);
+    for _ in 0..rows {
+        seq.push_str(&format!("{esc}[{cols}X{esc}[1B"));
+    }
+    seq.push_str(&format!("{esc}[{rows}A"));
+    seq.push_str(&format!(
+        "{esc}]1337;File=inline=1;size={len};width={cols};height={rows};preserveAspectRatio=1;doNotMoveCursor=1:"
+    ));
+    seq.push_str(b64);
+    seq.push('\x07');
+    seq.push_str(end);
+    seq
 }
 
 /// True if `title` contains an image-file extension followed by end-of-string
@@ -697,6 +773,24 @@ mod tests {
             assert_eq!(img.dimensions(), (20, 10));
             assert!(*delay >= std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn animated_gif_detection() {
+        assert_eq!(animated_gif_dims(&make_gif(6, 4, 3)), Some((6, 4)));
+        assert_eq!(animated_gif_dims(&make_gif(6, 4, 1)), None, "a still GIF isn't native");
+        assert_eq!(animated_gif_dims(b"\x89PNG\r\n"), None);
+    }
+
+    #[test]
+    fn iterm2_escape_sizes_in_cells_and_wraps_for_tmux() {
+        let seq = iterm2_escape("QUJD", 3, 10, 2, false);
+        assert!(seq.starts_with("\x1b[10X\x1b[1B\x1b[10X\x1b[1B\x1b[2A"));
+        assert!(seq.contains("]1337;File=inline=1;size=3;width=10;height=2;"));
+        assert!(seq.ends_with(":QUJD\x07"));
+        let t = iterm2_escape("QUJD", 3, 10, 2, true);
+        assert!(t.starts_with("\x1bPtmux;\x1b\x1b[10X"));
+        assert!(t.ends_with("\x07\x1b\\"));
     }
 
     #[test]
