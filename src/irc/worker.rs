@@ -33,9 +33,15 @@ const WANT_EXTRA_CAPS: &[&str] = &[
     // Tier-2 NAMES enrichment:
     "multi-prefix",
     "userhost-in-names",
+    // No NAMES burst on JOIN; the roster is fetched when a channel is first
+    // viewed (see App::request_active_members). Ratified name + soju's vendor one.
+    "no-implicit-names",
+    "soju.im/no-implicit-names",
     // Tier-2 protocol plumbing:
     "cap-notify",
     "labeled-response",
+    // FAIL/WARN/NOTE replies (shown as notices; FAIL CHATHISTORY ends loading).
+    "standard-replies",
     // NB: never REQ `sts` — the spec forbids it, and since CAP REQ is atomic a
     // server that NAKs it would refuse every other cap in the request too. The
     // policy is read from the LS value instead.
@@ -121,6 +127,13 @@ struct CapState {
     acked: HashSet<String>,
     /// Set once a NAKed REQ has been retried with `sasl` alone.
     nak_retried: bool,
+    /// SCRAM-SHA-256 exchange in progress (PLAIN credentials, upgraded when
+    /// the server lists the mechanism).
+    scram: Option<super::scram::ScramClient>,
+    /// A base64 SASL challenge split over 400-byte AUTHENTICATE lines.
+    sasl_buf: String,
+    /// SCRAM was refused (904) and we retried with PLAIN; don't loop.
+    scram_fell_back: bool,
 }
 
 /// Spawn a worker for one network. Returns the sender the UI uses to issue
@@ -276,6 +289,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx:
                                         let _ = out.send(Event::CapsAcked(acked));
                                         let mech = match auth_mode {
                                             AuthMode::SaslExternal => "EXTERNAL",
+                                            AuthMode::SaslPlain if cap_state.scram.is_some() => "SCRAM-SHA-256",
                                             AuthMode::SaslPlain => "PLAIN",
                                             _ => "",
                                         };
@@ -653,6 +667,15 @@ fn handle_auth_msg(
                 if !caps.acked.contains("sasl") {
                     return AuthOutcome::Failed("server ACKed CAP without sasl".into());
                 }
+                if wants_scram(mode, cfg, caps) {
+                    let pass = cfg.sasl_password.as_deref().unwrap_or("");
+                    caps.scram = Some(super::scram::ScramClient::new(cfg.sasl_user(), pass));
+                    if let Err(e) = sender.send(Command::AUTHENTICATE("SCRAM-SHA-256".into())) {
+                        return AuthOutcome::Failed(format!("send AUTHENTICATE: {e}"));
+                    }
+                    *phase = AuthPhase::AwaitingChallenge;
+                    return AuthOutcome::Pending;
+                }
                 let mech = match mode {
                     AuthMode::SaslExternal => "EXTERNAL",
                     _ => "PLAIN",
@@ -700,6 +723,9 @@ fn handle_auth_msg(
                 AuthOutcome::NeedIdentify
             }
         }
+        Command::AUTHENTICATE(data) if *phase == AuthPhase::AwaitingChallenge && caps.scram.is_some() => {
+            scram_step(data, &mut |c| sender.send(c).is_ok(), phase, caps)
+        }
         Command::AUTHENTICATE(data) if *phase == AuthPhase::AwaitingChallenge => {
             if data != "+" {
                 let _ = sender.send(Command::AUTHENTICATE("*".to_string()));
@@ -723,6 +749,23 @@ fn handle_auth_msg(
             AuthOutcome::Pending
         }
         Command::Response(code, args) => match *code {
+            // Success before we checked the server's SCRAM signature: the
+            // server never proved it knows our credentials. Don't trust it.
+            Response::RPL_SASLSUCCESS if caps.scram.is_some() && *phase != AuthPhase::AwaitingResult => {
+                AuthOutcome::Failed("SASL SCRAM: server reported success without proving its identity".into())
+            }
+            // The server refused SCRAM (some auth backends can't verify it
+            // even when the mechanism is listed): retry once with PLAIN.
+            Response::ERR_SASLFAIL if caps.scram.is_some() && !caps.scram_fell_back => {
+                caps.scram = None;
+                caps.scram_fell_back = true;
+                caps.sasl_buf.clear();
+                if let Err(e) = sender.send(Command::AUTHENTICATE("PLAIN".into())) {
+                    return AuthOutcome::Failed(format!("send AUTHENTICATE: {e}"));
+                }
+                *phase = AuthPhase::AwaitingChallenge;
+                AuthOutcome::Pending
+            }
             Response::RPL_SASLSUCCESS if *phase == AuthPhase::AwaitingResult => {
                 if let Err(e) = sender.send(Command::CAP(None, CapSubCommand::END, None, None)) {
                     return AuthOutcome::Failed(format!("send CAP END: {e}"));
@@ -742,6 +785,81 @@ fn handle_auth_msg(
         },
         _ => AuthOutcome::Pending,
     }
+}
+
+/// Upgrade SASL PLAIN to SCRAM-SHA-256 when the server lists it (CAP LS 302
+/// `sasl=` value) and we have a password: the password then never crosses
+/// the wire, and the server must prove it knows our credentials.
+fn wants_scram(mode: AuthMode, cfg: &NetworkConfig, caps: &CapState) -> bool {
+    mode == AuthMode::SaslPlain
+        && !caps.scram_fell_back
+        && cfg.sasl_password.as_deref().is_some_and(|p| !p.is_empty())
+        && caps
+            .values
+            .get("sasl")
+            .is_some_and(|v| v.split(',').any(|m| m.eq_ignore_ascii_case("SCRAM-SHA-256")))
+}
+
+/// One SCRAM-SHA-256 round: answer the server's `AUTHENTICATE` challenge with
+/// the next client message, or check its final signature.
+/// `send` queues a message and reports whether it could.
+fn scram_step(
+    data: &str,
+    send: &mut dyn FnMut(Command) -> bool,
+    phase: &mut AuthPhase,
+    caps: &mut CapState,
+) -> AuthOutcome {
+    use super::scram::Step;
+    use base64::Engine;
+    let mut abort = |why: &str| {
+        send(Command::AUTHENTICATE("*".to_string()));
+        AuthOutcome::Failed(format!("SASL SCRAM: {why}"))
+    };
+    // A challenge may span several lines: a full 400-byte chunk means more follows.
+    if data != "+" {
+        caps.sasl_buf.push_str(data);
+        if data.len() == 400 {
+            return AuthOutcome::Pending;
+        }
+    }
+    let raw = std::mem::take(&mut caps.sasl_buf);
+    let challenge = if raw.is_empty() {
+        String::new()
+    } else {
+        match base64::engine::general_purpose::STANDARD.decode(&raw).ok().and_then(|b| String::from_utf8(b).ok()) {
+            Some(c) => c,
+            None => return abort("malformed challenge"),
+        }
+    };
+    let Some(scram) = caps.scram.as_mut() else {
+        return abort("no exchange in progress");
+    };
+    let reply = match scram.step {
+        Step::Initial => scram.client_first(),
+        Step::SentFirst => match scram.client_final(&challenge) {
+            Some(m) => m,
+            None => return abort("malformed challenge"),
+        },
+        Step::SentFinal => {
+            // A wrong signature means the server doesn't know our
+            // credentials: possibly an impostor. Never fall back to PLAIN.
+            if !scram.verify(&challenge) {
+                caps.scram_fell_back = true;
+                return abort("server signature mismatch");
+            }
+            if !send(Command::AUTHENTICATE("+".into())) {
+                return AuthOutcome::Failed("send AUTHENTICATE failed".into());
+            }
+            *phase = AuthPhase::AwaitingResult;
+            return AuthOutcome::Pending;
+        }
+    };
+    for chunk in chunked_400(&b64_encode(reply.as_bytes())) {
+        if !send(Command::AUTHENTICATE(chunk)) {
+            return AuthOutcome::Failed("send AUTHENTICATE payload failed".into());
+        }
+    }
+    AuthOutcome::Pending
 }
 
 fn is_auth_wire(msg: &Message) -> bool {
@@ -1521,6 +1639,100 @@ mod tests {
     }
 
     use super::*;
+
+    /// Drive `scram_step` through the RFC 7677 exchange, base64 on the wire.
+    fn scram_round(caps: &mut CapState, phase: &mut AuthPhase, server: &str) -> (AuthOutcome, Vec<String>) {
+        use base64::Engine;
+        let mut sent = Vec::new();
+        let data = if server == "+" {
+            "+".to_string()
+        } else {
+            base64::engine::general_purpose::STANDARD.encode(server)
+        };
+        let out = scram_step(&data, &mut |c| {
+            if let Command::AUTHENTICATE(a) = c {
+                sent.push(a);
+            }
+            true
+        }, phase, caps);
+        (out, sent)
+    }
+
+    fn decoded(lines: &[String]) -> String {
+        use base64::Engine;
+        let b = base64::engine::general_purpose::STANDARD.decode(lines.concat()).unwrap();
+        String::from_utf8(b).unwrap()
+    }
+
+    fn scram_caps() -> CapState {
+        CapState {
+            scram: Some(super::super::scram::ScramClient::with_nonce("user", "pencil", "rOprNGfwEbeRWgbNEkqO".into())),
+            ..CapState::default()
+        }
+    }
+
+    const SCRAM_SERVER_FIRST: &str =
+        "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
+
+    #[test]
+    fn scram_exchange_completes_on_a_valid_server_signature() {
+        let mut caps = scram_caps();
+        let mut phase = AuthPhase::AwaitingChallenge;
+        let (_, sent) = scram_round(&mut caps, &mut phase, "+");
+        assert_eq!(decoded(&sent), "n,,n=user,r=rOprNGfwEbeRWgbNEkqO");
+        let (_, sent) = scram_round(&mut caps, &mut phase, SCRAM_SERVER_FIRST);
+        assert!(decoded(&sent).ends_with(",p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="));
+        let (out, sent) = scram_round(&mut caps, &mut phase, "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+        assert!(matches!(out, AuthOutcome::Pending));
+        assert_eq!(sent, vec!["+"]);
+        assert_eq!(phase, AuthPhase::AwaitingResult);
+    }
+
+    #[test]
+    fn scram_aborts_on_a_forged_server_signature() {
+        let mut caps = scram_caps();
+        let mut phase = AuthPhase::AwaitingChallenge;
+        scram_round(&mut caps, &mut phase, "+");
+        scram_round(&mut caps, &mut phase, SCRAM_SERVER_FIRST);
+        let (out, sent) = scram_round(&mut caps, &mut phase, "v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        assert!(matches!(out, AuthOutcome::Failed(_)));
+        assert_eq!(sent, vec!["*"]);
+        assert!(caps.scram_fell_back, "a forged signature must never fall back to PLAIN");
+    }
+
+    #[test]
+    fn scram_reassembles_a_challenge_split_at_400_bytes() {
+        let mut caps = scram_caps();
+        let mut phase = AuthPhase::AwaitingChallenge;
+        scram_round(&mut caps, &mut phase, "+");
+        let mut sent = 0;
+        let out = scram_step(&"A".repeat(400), &mut |_| { sent += 1; true }, &mut phase, &mut caps);
+        assert!(matches!(out, AuthOutcome::Pending));
+        assert_eq!(sent, 0);
+        assert_eq!(caps.sasl_buf.len(), 400, "waits for the rest of the challenge");
+    }
+
+    #[test]
+    fn scram_is_chosen_only_when_offered_with_a_password() {
+        let mut cfg = NetworkConfig {
+            name: "t".into(), nickname: "me".into(), username: None, realname: None,
+            server: "s".into(), port: 6697, use_tls: true, nick_password: None,
+            sasl_username: None, sasl_password: Some("pw".into()), client_cert_path: None,
+            client_cert_pass: None, channels: vec![], buddies: vec![], autoconnect: true,
+        };
+        let mut caps = CapState::default();
+        caps.values.insert("sasl".into(), "PLAIN,SCRAM-SHA-256".into());
+        assert!(wants_scram(AuthMode::SaslPlain, &cfg, &caps));
+        assert!(!wants_scram(AuthMode::SaslExternal, &cfg, &caps));
+        caps.scram_fell_back = true;
+        assert!(!wants_scram(AuthMode::SaslPlain, &cfg, &caps));
+        caps.scram_fell_back = false;
+        caps.values.insert("sasl".into(), "PLAIN,EXTERNAL".into());
+        assert!(!wants_scram(AuthMode::SaslPlain, &cfg, &caps));
+        cfg.sasl_password = None;
+        caps.values.insert("sasl".into(), "SCRAM-SHA-256".into());
+        assert!(!wants_scram(AuthMode::SaslPlain, &cfg, &caps));
+    }
 
     fn namreply(chan: &str, names: &str) -> Message {
         Message {

@@ -133,6 +133,7 @@ impl App {
                 // (this was the "random missing messages" bug — the gap stayed
                 // missing forever). In-flight staging is stale too; drop it.
                 for b in &mut self.networks[ni].buffers {
+                    b.names_pending = false;
                     // Remember where the scrollback stops so the refetch can
                     // page forward through the whole gap. An anchor still set
                     // means the buffer never fetched its previous gap: keep it.
@@ -215,7 +216,14 @@ impl App {
                 // badge appears immediately instead of only after a rejoin.
                 if is_self {
                     self.request_latest_history(ni, bi);
-                    self.request_who(ni, &channel);
+                    // Under no-implicit-names nothing arrives until we ask:
+                    // defer NAMES + WHO until the channel is first viewed, so
+                    // channels you never open cost no roster traffic.
+                    if self.networks[ni].no_implicit_names() {
+                        self.networks[ni].buffers[bi].names_pending = true;
+                    } else {
+                        self.request_who(ni, &channel);
+                    }
                 } else {
                     self.request_who(ni, &nick);
                 }
@@ -248,6 +256,9 @@ impl App {
                         // roster is stale, so drop it and let a later rejoin
                         // rebuild cleanly from a fresh NAMES.
                         m.clear();
+                        if let Some(bi) = net.find_buffer(&channel) {
+                            net.buffers[bi].names_pending = false;
+                        }
                     } else {
                         m.retain(|e| !e.nick.eq_ignore_ascii_case(&nick));
                     }
@@ -709,6 +720,24 @@ impl App {
             cmd: "WHO".into(),
             args: vec![target.to_string()],
         });
+    }
+
+    /// Under `no-implicit-names`, fetch the active channel's roster (NAMES, plus
+    /// a WHO for bot/away flags) the first time it's viewed after joining.
+    pub fn request_active_members(&mut self) {
+        let (ni, bi) = (self.active.net, self.active.buf);
+        let Some(buf) = self.networks.get_mut(ni).and_then(|n| n.buffers.get_mut(bi)) else {
+            return;
+        };
+        if !std::mem::take(&mut buf.names_pending) {
+            return;
+        }
+        let channel = buf.name.clone();
+        let _ = self.networks[ni].out.try_send(Outgoing::Raw {
+            cmd: "NAMES".into(),
+            args: vec![channel.clone()],
+        });
+        self.request_who(ni, &channel);
     }
 
     /// Ensure the active buffer has requested its initial backlog. Called from
@@ -1963,6 +1992,48 @@ mod tests {
         });
         assert!(matches!(take_history_request(&mut out_rx), Some(Outgoing::ChatHistoryLatest { .. })));
         assert_eq!(app.networks[0].buffers[bi].catchup_pages, 0);
+    }
+
+    fn raw_cmds(out_rx: &mut mpsc::Receiver<Outgoing>) -> Vec<String> {
+        std::iter::from_fn(|| out_rx.try_recv().ok())
+            .filter_map(|o| match o {
+                Outgoing::Raw { cmd, args } => Some(format!("{cmd} {}", args.join(" "))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_implicit_names_defers_roster_until_viewed() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].caps = vec!["no-implicit-names".into(), "away-notify".into()];
+        app.apply_event(0, Event::UserJoined {
+            channel: "#c".into(), nick: "me".into(),
+            userhost: None, account: None, realname: None, meta: meta(),
+        });
+        assert!(raw_cmds(&mut out_rx).is_empty(), "nothing until the channel is viewed");
+        let bi = app.networks[0].find_buffer("#c").unwrap();
+        app.select_buffer(0, bi);
+        app.request_active_members();
+        assert_eq!(raw_cmds(&mut out_rx), vec!["NAMES #c", "WHO #c"]);
+        // Only once per join.
+        app.request_active_members();
+        assert!(raw_cmds(&mut out_rx).is_empty());
+    }
+
+    #[test]
+    fn implicit_names_still_whos_on_join() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].caps = vec!["away-notify".into()];
+        app.apply_event(0, Event::UserJoined {
+            channel: "#c".into(), nick: "me".into(),
+            userhost: None, account: None, realname: None, meta: meta(),
+        });
+        assert_eq!(raw_cmds(&mut out_rx), vec!["WHO #c"]);
+        let bi = app.networks[0].find_buffer("#c").unwrap();
+        app.select_buffer(0, bi);
+        app.request_active_members();
+        assert!(raw_cmds(&mut out_rx).is_empty(), "the server already sent NAMES");
     }
 
     #[test]

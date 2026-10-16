@@ -373,6 +373,7 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         // Backlog from a bouncer/server: fetch the active buffer's initial
         // history, and (after the draw decided we're at the top) older pages.
         app.maybe_load_active_history();
+        app.request_active_members();
         app.request_older_history();
     }
 

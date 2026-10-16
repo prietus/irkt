@@ -1,4 +1,5 @@
 pub mod event;
+pub mod scram;
 pub mod worker;
 
 pub use event::*;

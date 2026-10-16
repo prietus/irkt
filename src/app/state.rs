@@ -147,6 +147,9 @@ pub struct Buffer {
     /// Catch-up pages fetched so far this reconnect; non-zero while one is in
     /// flight (its batch then isn't an initial/scroll-up page).
     pub catchup_pages: u8,
+    /// Joined under `no-implicit-names` and the roster hasn't been asked for
+    /// yet: NAMES (+ WHO) goes out the first time the channel is viewed.
+    pub names_pending: bool,
 }
 
 impl Buffer {
@@ -173,6 +176,7 @@ impl Buffer {
             request_older: false,
             catchup_from: None,
             catchup_pages: 0,
+            names_pending: false,
         }
     }
 
@@ -318,6 +322,13 @@ pub struct Network {
     /// only that tag (or an empty page) ends history; a short page doesn't,
     /// since servers like Ergo return short pages mid-history.
     pub history_end_tag_seen: bool,
+}
+
+impl Network {
+    /// The server won't push NAMES on JOIN; we ask for it on demand.
+    pub fn no_implicit_names(&self) -> bool {
+        self.caps.iter().any(|c| c == "no-implicit-names" || c == "soju.im/no-implicit-names")
+    }
 }
 
 impl Network {
