@@ -5,31 +5,29 @@ use super::state::*;
 use crate::upload::{UploadJob, UploadMsg};
 
 impl App {
+    /// The custom uploader, when one is selected and actually has a URL.
+    fn custom_uploader(&self) -> Option<&crate::config::CustomUploader> {
+        self.upload_cfg
+            .custom
+            .as_ref()
+            .filter(|c| self.upload_cfg.use_custom && !c.url.trim().is_empty())
+    }
+
     /// True when there's a usable upload destination: a configured custom
     /// uploader, or a FILEHOST endpoint advertised by the active network.
     pub fn has_upload_target(&self) -> bool {
-        if self.upload_cfg.use_custom {
-            self.upload_cfg
-                .custom
-                .as_ref()
-                .is_some_and(|c| !c.url.trim().is_empty())
-        } else {
-            self.active_net()
-                .is_some_and(|n| n.isupport.filehost.is_some())
-        }
+        self.custom_uploader().is_some()
+            || self.active_net().is_some_and(|n| n.isupport.filehost.is_some())
     }
 
     /// Build the concrete upload job for the active backend. `Ok(None)` means
     /// no target is configured; `Err(msg)` means a target exists but can't be
     /// used (e.g. a plaintext endpoint over a TLS connection).
     fn resolve_upload_job(&self) -> Result<Option<UploadJob>, String> {
-        if self.upload_cfg.use_custom {
-            let Some(c) = self.upload_cfg.custom.as_ref() else {
-                return Ok(None);
-            };
-            if c.url.trim().is_empty() {
-                return Ok(None);
-            }
+        // The custom uploader wins when it's selected and configured; with no
+        // URL set it falls back to the server's FILEHOST (as arkhe does)
+        // rather than leaving no target at all.
+        if let Some(c) = self.custom_uploader() {
             return Ok(Some(UploadJob::Custom {
                 url: c.url.trim().to_string(),
                 token: c.token.clone().filter(|t| !t.is_empty()),
@@ -75,9 +73,11 @@ impl App {
         let job = match self.resolve_upload_job() {
             Ok(Some(job)) => job,
             Ok(None) => {
-                self.set_status(
-                    "no upload target: this network advertises no FILEHOST; set [upload.custom] in config",
-                );
+                self.set_status(if self.upload_cfg.use_custom {
+                    "no upload target: use_custom is on but [upload.custom] has no url, and this network advertises no FILEHOST"
+                } else {
+                    "no upload target: this network advertises no FILEHOST; set [upload.custom] in config"
+                });
                 return;
             }
             Err(msg) => {

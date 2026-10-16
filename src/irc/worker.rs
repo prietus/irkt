@@ -1510,6 +1510,16 @@ fn unwrap_ctcp_reply(text: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn soju_filehost_isupport_is_parsed() {
+        let msg: Message = ":irc.priet.us 005 teraflops BOT=B CASEMAPPING=ascii soju.im/FILEHOST=https://irc.priet.us/uploads soju.im/NO_IMPLICIT_NAMES :are supported"
+            .parse()
+            .unwrap();
+        let mut is = ISupport::default();
+        let evs = translate(msg, &HashMap::new(), &mut is);
+        assert_eq!(is.filehost.as_deref(), Some("https://irc.priet.us/uploads"), "events: {}", evs.len());
+    }
+
     use super::*;
 
     fn namreply(chan: &str, names: &str) -> Message {
