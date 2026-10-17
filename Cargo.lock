@@ -1397,6 +1397,7 @@ dependencies = [
  "image",
  "indexmap",
  "irc",
+ "libc",
  "mime_guess",
  "notify-rust",
  "ratatui",

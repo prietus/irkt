@@ -102,7 +102,17 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
 
     // Detect the terminal's graphics protocol (Kitty / iTerm2 / Sixel) for
     // inline images, falling back to unicode halfblocks.
-    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::from_fontsize((8, 16)));
+    // iTerm2 (3.7+) answers the standard cell-size query in points, so on a
+    // Retina display images came out at half size. Its own ReportCellSize
+    // carries the backing scale; use that to get real pixels.
+    if images::is_iterm2_picker(&picker) && std::env::var_os("TMUX").is_none() {
+        if let Some(px) = images::iterm2_cell_px() {
+            let pt = picker.protocol_type();
+            picker = Picker::from_fontsize(px);
+            picker.set_protocol_type(pt);
+        }
+    }
     let (img_tx, mut img_rx) = mpsc::channel::<ImageMsg>(64);
     let images = Images::new(picker, img_tx);
     // Channel uploads report their result back on, bridged into the Tick loop.

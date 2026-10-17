@@ -278,6 +278,76 @@ async fn fetch_inner(http: &reqwest::Client, picker: &Picker, url: &str) -> Resu
     Ok(Fetched::Nothing)
 }
 
+pub fn is_iterm2_picker(picker: &Picker) -> bool {
+    matches!(picker.protocol_type(), ratatui_image::picker::ProtocolType::Iterm2)
+}
+
+/// The cell size in device pixels from iTerm2's `OSC 1337;ReportCellSize`
+/// (`height;width;scale`, in points). Followed by a DSR query that every
+/// terminal answers, so reading stops at that reply instead of waiting out
+/// the timeout when the first query goes unanswered. Turns raw mode on for
+/// the exchange if it isn't already (so the reply isn't echoed).
+#[cfg(unix)]
+pub fn iterm2_cell_px() -> Option<(u16, u16)> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !was_raw {
+        crossterm::terminal::enable_raw_mode().ok()?;
+    }
+    let reply = (|| {
+        let mut out = std::io::stdout();
+        out.write_all(b"\x1b]1337;ReportCellSize\x07\x1b[5n").ok()?;
+        out.flush().ok()?;
+        let fd = std::io::stdin().as_raw_fd();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut buf = Vec::new();
+        while !buf.windows(4).any(|w| w == b"\x1b[0n") {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            // SAFETY: one valid pollfd, and a stack buffer of the length passed.
+            if unsafe { libc::poll(&mut pfd, 1, left.as_millis() as i32) } <= 0 {
+                break;
+            }
+            let mut chunk = [0u8; 256];
+            let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+            if n <= 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n as usize]);
+        }
+        Some(buf)
+    })();
+    if !was_raw {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+    parse_report_cell_size(&reply?)
+}
+
+#[cfg(not(unix))]
+pub fn iterm2_cell_px() -> Option<(u16, u16)> {
+    None
+}
+
+/// `…ReportCellSize=<height>;<width>[;<scale>]` (ST- or BEL-terminated) →
+/// `(width, height)` in device pixels.
+fn parse_report_cell_size(buf: &[u8]) -> Option<(u16, u16)> {
+    let s = String::from_utf8_lossy(buf);
+    let rest = &s[s.find("ReportCellSize=")? + "ReportCellSize=".len()..];
+    let body = &rest[..rest.find(['\x1b', '\x07'])?];
+    let mut vals = body.split(';').map(|v| v.parse::<f64>().ok());
+    let h = vals.next()??;
+    let w = vals.next()??;
+    let scale = vals.next().flatten().unwrap_or(1.0);
+    let (w, h) = ((w * scale).round(), (h * scale).round());
+    (w >= 1.0 && h >= 1.0 && w < 1000.0 && h < 1000.0).then_some((w as u16, h as u16))
+}
+
 /// Decode raw bytes into a terminal-graphics protocol on a blocking thread.
 async fn decode_image(picker: &Picker, bytes: Vec<u8>) -> Result<(StatefulProtocol, u32, u32), String> {
     if bytes.len() as u64 > MAX_IMAGE_BYTES {
@@ -773,6 +843,16 @@ mod tests {
             assert_eq!(img.dimensions(), (20, 10));
             assert!(*delay >= std::time::Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn iterm2_retina_cell_report_is_scaled_to_pixels() {
+        // Verbatim iTerm2 3.7.6 reply on a 2x display (ST-terminated), with
+        // the CSI 16t / DSR answers that follow it.
+        let reply = b"\x1b]1337;ReportCellSize=15.0;7.0;2.0\x1b\\\x1b[6;15;7t\x1b[0n";
+        assert_eq!(parse_report_cell_size(reply), Some((14, 30)));
+        assert_eq!(parse_report_cell_size(b"\x1b]1337;ReportCellSize=16.5;8.25\x07"), Some((8, 17)));
+        assert_eq!(parse_report_cell_size(b"\x1b[0n"), None, "no answer: keep the query's size");
     }
 
     #[test]

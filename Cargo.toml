@@ -37,6 +37,10 @@ spellbook = "0.4.2"
 # Desktop notifications (D-Bus on Linux, NSUserNotification on macOS, WinRT toast on Windows)
 notify-rust = "4"
 
+[target.'cfg(unix)'.dependencies]
+# Raw stdin poll/read for iTerm2's ReportCellSize query (see images::iterm2_cell_px).
+libc = "0.2"
+
 [profile.release]
 lto = true
 codegen-units = 1
