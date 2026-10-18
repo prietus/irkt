@@ -23,6 +23,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             }
             app.should_quit = true;
         }
+        // Repaint everything, in case something outside irkt wiped or garbled
+        // the screen (the diff only sends cells it believes changed).
+        KeyCode::Char('l') if ctrl => app.force_repaint = true,
         KeyCode::Char('n') if ctrl => app.cycle_buffer(true),
         KeyCode::Char('p') if ctrl => app.cycle_buffer(false),
         KeyCode::Char('u') if ctrl => {

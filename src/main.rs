@@ -15,8 +15,8 @@ use std::io::{self, Stdout};
 use std::sync::OnceLock;
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event as CEvent, EventStream, KeyEventKind,
-    MouseButton, MouseEventKind,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    Event as CEvent, EventStream, KeyEventKind, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
@@ -89,6 +89,9 @@ enum Tick {
     /// Left-click at a screen cell `(column, row)`. Only emitted when
     /// `mouse = true`.
     Click(u16, u16),
+    /// The terminal tab/window regained focus. iTerm2 can wipe a background
+    /// tab's screen behind our back, so this triggers a full repaint.
+    Focus,
     Irc(usize, IrcEvent),
     Image(ImageMsg),
     Upload(upload::UploadMsg),
@@ -242,6 +245,7 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
                 let tick = match item {
                     Ok(CEvent::Key(k)) => Some(Tick::Key(k)),
                     Ok(CEvent::Resize(_, _)) => Some(Tick::Resize),
+                    Ok(CEvent::FocusGained) => Some(Tick::Focus),
                     Ok(CEvent::Mouse(m)) => match m.kind {
                         MouseEventKind::ScrollUp => Some(Tick::Scroll(1)),
                         MouseEventKind::ScrollDown => Some(Tick::Scroll(-1)),
@@ -325,6 +329,10 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
                     keys::click(&mut app, x, y);
                     need_redraw = true;
                 }
+                Tick::Focus => {
+                    app.force_repaint = true;
+                    need_redraw = true;
+                }
                 Tick::Irc(id, ev) => {
                     app.apply_event(id, ev);
                     need_redraw = true;
@@ -375,7 +383,19 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         } else {
             new_view != view
         };
-        if (changed || resized) && app.images.graphics_active() {
+        // A resize always repaints in full: iTerm2 may drop or reflow the
+        // alternate screen's contents on a resize even when the size ends up
+        // unchanged, and the diff would then only send the cells it thinks
+        // changed, leaving panels and stray letters missing.
+        if resized {
+            // On disk so a garbled screen can be matched to a resize that
+            // happened while irkt sat in a background tab.
+            if let Ok(size) = term.size() {
+                irc::diag_log("ui", &format!("resize -> {}x{}", size.width, size.height));
+            }
+        }
+        let repaint = std::mem::take(&mut app.force_repaint) || resized;
+        if repaint || (changed && app.images.graphics_active()) {
             drawer.clear(&mut term)?;
         }
         view = new_view;
@@ -401,7 +421,7 @@ fn view_key(app: &App) -> (usize, usize, usize, bool, bool) {
 fn setup_terminal(mouse: bool) -> io::Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableFocusChange)?;
     // Capturing the mouse lets the wheel scroll the buffer, at the cost of the
     // terminal's native text selection (the user opts in via `mouse = true`).
     if mouse {
@@ -418,7 +438,7 @@ fn restore_terminal(term: &mut Term, mouse: bool) -> io::Result<()> {
     if mouse {
         execute!(term.backend_mut(), DisableMouseCapture)?;
     }
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    execute!(term.backend_mut(), DisableFocusChange, LeaveAlternateScreen)?;
     term.show_cursor()?;
     Ok(())
 }

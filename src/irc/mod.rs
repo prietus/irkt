@@ -3,4 +3,4 @@ pub mod scram;
 pub mod worker;
 
 pub use event::*;
-pub use worker::spawn_network;
+pub use worker::{diag_log, spawn_network};

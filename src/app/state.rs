@@ -395,6 +395,8 @@ pub struct App {
     /// Cursor position as a byte offset into `input`.
     pub cursor: usize,
     pub should_quit: bool,
+    /// Ctrl+L: wipe the screen and repaint every cell on the next frame.
+    pub force_repaint: bool,
     pub show_members: bool,
     pub show_sidebar: bool,
     pub inline_images: bool,
@@ -498,6 +500,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             should_quit: false,
+            force_repaint: false,
             show_members: true,
             show_sidebar: true,
             inline_images,

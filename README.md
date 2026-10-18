@@ -97,6 +97,7 @@ Add more `[[network]]` blocks to connect to multiple networks.
 | `Enter` | send message / run command |
 | `Tab` | complete nick, `/command`, or file path (after `/upload`) |
 | `Ctrl+N` / `Ctrl+P` | next / previous buffer |
+| `Ctrl+L` | repaint the whole screen |
 | `Alt+1`..`9` | jump to the Nth network |
 | `Alt+↑` / `Alt+↓` | select a message (for reply/react); `Esc` deselects |
 | `Enter` (with a message selected) | send your text as a threaded reply to it |

@@ -57,7 +57,7 @@ const WANT_EXTRA_CAPS: &[&str] = &[
 /// Append a line to `irkt.log` next to `config.toml`, timestamped in local
 /// time. Every connect/disconnect funnels through here so the exact reason and
 /// cadence of connection drops are on disk to read back later.
-fn diag_log(net: &str, msg: &str) {
+pub fn diag_log(net: &str, msg: &str) {
     let Some(dir) = crate::config::config_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
     else {
         return;

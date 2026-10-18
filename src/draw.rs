@@ -31,7 +31,8 @@ fn symbol_width(symbol: &str) -> usize {
     }
 }
 
-/// Same as `Buffer::diff` (ratatui 0.29), but with [`symbol_width`].
+/// `Buffer::diff` as of ratatui-core 0.1 (ratatui 0.30), but with
+/// [`symbol_width`]. Includes 0.30's VS16 workaround, which 0.29 lacks.
 pub fn diff<'a>(previous: &Buffer, next: &'a Buffer) -> Vec<(u16, u16, &'a Cell)> {
     let mut updates: Vec<(u16, u16, &Cell)> = Vec::new();
     // Cells invalidated by drawing/replacing preceding multi-width characters.
@@ -43,6 +44,23 @@ pub fn diff<'a>(previous: &Buffer, next: &'a Buffer) -> Vec<(u16, u16, &'a Cell)
         if !current.skip && (current != prev || invalidated > 0) && to_skip == 0 {
             let (x, y) = next.pos_of(i);
             updates.push((x, y, current));
+
+            // Terminals (iTerm2 among them) may leave the trailing cell of a
+            // wide emoji presentation sequence (VS16, e.g. ❤️ ✔️) dirty, so
+            // whatever was there before stays on screen: clear it explicitly.
+            if cur_w > 1 && current.symbol().contains('\u{FE0F}') {
+                for k in 1..cur_w {
+                    let j = i + k;
+                    if j >= next.content.len() || j >= previous.content.len() {
+                        break;
+                    }
+                    let (prev_trailing, next_trailing) = (&previous.content[j], &next.content[j]);
+                    if !next_trailing.skip && prev_trailing != next_trailing {
+                        let (tx, ty) = next.pos_of(j);
+                        updates.push((tx, ty, next_trailing));
+                    }
+                }
+            }
         }
         to_skip = cur_w.saturating_sub(1);
         let affected_width = cur_w.max(symbol_width(prev.symbol()));
@@ -158,6 +176,18 @@ mod tests {
         let updates = diff(&a, &b);
         assert_eq!(updates.len(), 1);
         assert_eq!((updates[0].0, updates[0].1), (22, 1));
+    }
+
+    #[test]
+    fn vs16_emoji_clears_its_trailing_cell() {
+        let mut a = Buffer::empty(Rect::new(0, 0, 4, 1));
+        a.set_string(0, 0, "ab", Style::default());
+        let mut b = Buffer::empty(Rect::new(0, 0, 4, 1));
+        b.set_string(0, 0, "\u{2764}\u{FE0F}", Style::default()); // ❤️, two columns
+        let updates = diff(&a, &b);
+        // The emoji at x=0 *and* an explicit blank for x=1, where "b" was.
+        assert!(updates.iter().any(|(x, _, c)| *x == 0 && c.symbol().contains('\u{FE0F}')));
+        assert!(updates.iter().any(|(x, _, _)| *x == 1), "trailing cell must be repainted");
     }
 
     #[test]
