@@ -147,6 +147,15 @@ pub struct Buffer {
     /// Catch-up pages fetched so far this reconnect; non-zero while one is in
     /// flight (its batch then isn't an initial/scroll-up page).
     pub catchup_pages: u8,
+    /// Originals of replies that predate the scrollback, fetched on demand
+    /// with `/original` (CHATHISTORY AROUND) and quoted above the reply.
+    pub reply_context: std::collections::HashMap<String, Line>,
+    /// msgid whose `CHATHISTORY AROUND` batch is in flight: that batch goes
+    /// to `reply_context`, not into the timeline.
+    pub around_pending: Option<String>,
+    /// Paging back for a reply's original on a timestamp-only server:
+    /// (msgid, pages left).
+    pub seek_original: Option<(String, u8)>,
     /// Joined under `no-implicit-names` and the roster hasn't been asked for
     /// yet: NAMES (+ WHO) goes out the first time the channel is viewed.
     pub names_pending: bool,
@@ -177,6 +186,9 @@ impl Buffer {
             catchup_from: None,
             catchup_pages: 0,
             names_pending: false,
+            reply_context: Default::default(),
+            around_pending: None,
+            seek_original: None,
         }
     }
 
@@ -329,6 +341,8 @@ pub struct Network {
     /// only that tag (or an empty page) ends history; a short page doesn't,
     /// since servers like Ergo return short pages mid-history.
     pub history_end_tag_seen: bool,
+    /// `/rawlog` is on: wire traffic goes to the `*raw*` buffer.
+    pub raw_log: bool,
     /// Channel of the latest invitation for us: a bare `/join` accepts it.
     pub last_invite: Option<String>,
     /// `/mute`d conversations (lowercased): no desktop notifications.
@@ -371,6 +385,7 @@ impl Network {
             registered: false,
             pending_replies: Vec::new(),
             history_end_tag_seen: false,
+            raw_log: false,
             last_invite: None,
             muted: Default::default(),
             pinned: Default::default(),

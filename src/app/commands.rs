@@ -525,6 +525,23 @@ impl App {
                 self.cmd_nick_list(NickList::Ignore, rest);
                 self.sync_ignore_edit(&before);
             }
+            "original" | "orig" => self.fetch_original(),
+            "rawlog" => {
+                let on = match rest {
+                    "on" => true,
+                    "off" => false,
+                    _ => !self.networks[ni].raw_log,
+                };
+                self.networks[ni].raw_log = on;
+                let _ = self.networks[ni].out.try_send(Outgoing::RawLog(on));
+                if on {
+                    let bi = self.networks[ni].ensure_buffer(crate::app::update::RAW_BUFFER, BufferKind::Status);
+                    self.active = ActiveBuffer { net: ni, buf: bi };
+                    self.set_status("rawlog on: wire traffic in *raw* (passwords redacted); /rawlog to stop");
+                } else {
+                    self.set_status("rawlog off");
+                }
+            }
             "mute" | "unmute" | "pin" | "unpin" => {
                 let key = if cmd_lc.ends_with("mute") { crate::app::metadata::MUTED } else { crate::app::metadata::PINNED };
                 let on = !cmd_lc.starts_with("un");

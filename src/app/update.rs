@@ -17,6 +17,9 @@ const CATCHUP_MAX_PAGES: u8 = 10;
 /// history (draft/chathistory + draft/event-playback), not a live event. Such
 /// JOIN/PART/QUIT events are stale membership churn and must not mutate the live
 /// roster; only real-time presence and the NAMES burst are authoritative.
+/// Name of the buffer `/rawlog` writes to.
+pub const RAW_BUFFER: &str = "*raw*";
+
 fn is_playback(meta: &MsgMeta) -> bool {
     meta.batch_kind.as_deref() == Some("chathistory")
 }
@@ -122,6 +125,17 @@ impl App {
                 self.on_metadata(ni, &target, &key, value.as_deref());
             }
             Event::MetadataSubOk(keys) => self.on_metadata_sub_ok(ni, &keys),
+            Event::Wire { outgoing, line } => {
+                let net = &mut self.networks[ni];
+                if !net.raw_log {
+                    return;
+                }
+                // A status-kind buffer: never history, NAMES or MONITOR, and
+                // pushed to directly so it doesn't count as unread.
+                let bi = net.ensure_buffer(RAW_BUFFER, BufferKind::Status);
+                let arrow = if outgoing { "→" } else { "←" };
+                net.buffers[bi].push(Line::system(format!("{arrow} {line}")));
+            }
             Event::CapsAcked(caps) => {
                 self.networks[ni].caps = caps;
             }
@@ -161,6 +175,8 @@ impl App {
                     b.history_loading = false;
                     b.history_stage.clear();
                     b.history_stage_oldest_ts = None;
+                    b.around_pending = None;
+                    b.seek_original = None;
                 }
                 self.networks[ni].status_mut().push(Line::system("disconnected"));
             }
@@ -542,6 +558,11 @@ impl App {
                 // otherwise they show "loading" forever, or — once scrolled to
                 // the top — re-send the refused request on every redraw.
                 for b in &mut self.networks[ni].buffers {
+                    // A refused AROUND (`/original`) says nothing about paging.
+                    if b.around_pending.take().is_some() {
+                        b.history_loading = false;
+                        continue;
+                    }
                     if b.history_loading {
                         b.history_loading = false;
                         b.catchup_pages = 0;
@@ -592,9 +613,10 @@ impl App {
         meta: &MsgMeta,
         action: bool,
     ) {
-        if self.ignored(nick) {
-            return;
-        }
+        // An ignored sender's lines are kept but hidden when rendered, so
+        // `/ignore del` brings them back. They never count, notify, or open a
+        // new conversation.
+        let ignored = self.ignored(nick);
         let our_nick = self.networks[ni].nick.clone();
         let is_self = nick.eq_ignore_ascii_case(&our_nick);
         // Determine the buffer: a channel target maps to itself; a DM to us
@@ -611,8 +633,11 @@ impl App {
         } else {
             BufferKind::Query
         };
+        if ignored && self.networks[ni].find_buffer(&bname).is_none() {
+            return;
+        }
         let bi = self.networks[ni].ensure_buffer(&bname, kind);
-        let highlight = !is_self && self.is_mention(ni, body);
+        let highlight = !is_self && !ignored && self.is_mention(ni, body);
         // If this is the echo of one of our own replies and the server didn't
         // echo the +draft/reply tag back, re-apply it from the pending list.
         let mut reply_to = meta.reply_to_msgid.clone();
@@ -713,6 +738,10 @@ impl App {
         // Clear the sender from the typing list.
         let typing = &mut self.networks[ni].buffers[bi].typing;
         typing.retain(|(n, _)| !n.eq_ignore_ascii_case(nick));
+        if ignored {
+            self.networks[ni].buffers[bi].push(line);
+            return;
+        }
         self.push_to(ni, bi, line);
     }
 
@@ -908,6 +937,17 @@ impl App {
         buf.history_loading = false;
         let staged = std::mem::take(&mut buf.history_stage);
         let oldest = buf.history_stage_oldest_ts.take();
+        // An AROUND answer for `/original`: keep just the original, apart
+        // from the timeline (no disconnected island in the scrollback).
+        if let Some(id) = buf.around_pending.take() {
+            match staged.into_iter().find(|l| l.msgid.as_deref() == Some(id.as_str())) {
+                Some(orig) => {
+                    buf.reply_context.insert(id, orig);
+                }
+                None => self.set_status("original not found on the server"),
+            }
+            return;
+        }
         // Does this page extend the *older* end of what we hold (initial load or
         // a BEFORE page)? Only then does a short page mean the server has no
         // older history. A LATEST refetch after a reconnect covers the offline
@@ -957,6 +997,9 @@ impl App {
             }
         }
         if staged.is_empty() {
+            // Nothing new on this page (all duplicates): a `/original` seek
+            // must still move on.
+            self.advance_original_seek(ni, bi);
             return;
         }
         if extends_older && oldest.is_some() {
@@ -982,6 +1025,74 @@ impl App {
             None => 0,
         };
         buf.lines.splice(at..at, staged);
+        self.advance_original_seek(ni, bi);
+    }
+
+    /// Timestamp-only servers (soju): after an older page lands, stop if the
+    /// sought original showed up, else page back again while budget remains.
+    fn advance_original_seek(&mut self, ni: usize, bi: usize) {
+        let buf = &mut self.networks[ni].buffers[bi];
+        let Some((id, left)) = buf.seek_original.take() else {
+            return;
+        };
+        if buf.lines.iter().any(|l| l.msgid.as_deref() == Some(id.as_str())) {
+            self.set_status("original loaded: the reply now sits under it, further up");
+        } else if left > 0 && !buf.history_exhausted {
+            buf.seek_original = Some((id, left - 1));
+            buf.request_older = true;
+        } else {
+            self.set_status("original not found in the history");
+        }
+    }
+
+    /// `/original`: fetch the original of the selected reply when it predates
+    /// the loaded scrollback.
+    pub fn fetch_original(&mut self) {
+        let (ni, bi) = (self.active.net, self.active.buf);
+        let Some(buf) = self.networks.get(ni).and_then(|n| n.buffers.get(bi)) else {
+            return;
+        };
+        let Some(sel) = buf.selection.as_deref() else {
+            self.set_status("select a reply first (Alt+↑/↓), then /original");
+            return;
+        };
+        let Some(pid) = buf.lines.iter().find(|l| l.msgid.as_deref() == Some(sel)).and_then(|l| l.reply_to.clone()) else {
+            self.set_status("the selected message isn't a reply");
+            return;
+        };
+        if buf.reply_context.contains_key(&pid) || buf.lines.iter().any(|l| l.msgid.as_deref() == Some(pid.as_str())) {
+            self.set_status("the original is already shown");
+            return;
+        }
+        let net = &self.networks[ni];
+        if !net.caps.iter().any(|c| c == "draft/chathistory") {
+            self.set_status("this server keeps no history to fetch it from");
+            return;
+        }
+        let by_msgid = net.isupport.msgreftypes.iter().any(|t| t == "msgid");
+        let net = &mut self.networks[ni];
+        let buf = &mut net.buffers[bi];
+        if buf.history_loading {
+            self.set_status("history is loading; try again in a moment");
+            return;
+        }
+        if by_msgid {
+            buf.around_pending = Some(pid.clone());
+            buf.history_loading = true;
+            let target = buf.name.clone();
+            let _ = net.out.try_send(Outgoing::Raw {
+                cmd: "CHATHISTORY".into(),
+                args: vec!["AROUND".into(), target, format!("msgid={pid}"), "5".into()],
+            });
+            self.set_status("fetching the original…");
+        } else if buf.history_exhausted {
+            self.set_status("original not found in the history");
+        } else {
+            // Up to five older pages (the first one now).
+            buf.seek_original = Some((pid, 4));
+            buf.request_older = true;
+            self.set_status("paging back for the original…");
+        }
     }
 
     /// Submit the current input line. Returns false on no-op.
@@ -2321,6 +2432,104 @@ mod tests {
         assert_eq!(app.networks[0].profile("alice2", "pronouns"), Some("she/her"));
         md(&mut app, "alice2", "pronouns", None);
         assert!(app.networks[0].profile("alice2", "pronouns").is_none());
+    }
+
+    #[test]
+    fn ignored_messages_are_kept_silently_and_open_no_query() {
+        let (mut app, _rx) = app_with_outbox();
+        app.ignored_nicks = vec!["troll".into()];
+        let c = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.apply_event(0, Event::Privmsg { target: "#c".into(), nick: "troll".into(), body: "me me me".into(), meta: meta() });
+        let buf = &app.networks[0].buffers[c];
+        assert_eq!(buf.lines.len(), 1, "kept for a later /ignore del");
+        assert_eq!((buf.unread, buf.mentions), (0, 0));
+        assert!(!buf.lines[0].highlight);
+        app.apply_event(0, Event::Privmsg { target: "me".into(), nick: "troll".into(), body: "psst".into(), meta: meta() });
+        assert!(app.networks[0].find_buffer("troll").is_none());
+    }
+
+    /// `#c` with a reply (`r1`) to `p0`, which isn't loaded, selected.
+    fn orphan_reply_app() -> (App, mpsc::Receiver<Outgoing>, usize) {
+        let (mut app, rx) = app_with_outbox();
+        app.networks[0].caps = vec!["draft/chathistory".into()];
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        let buf = &mut app.networks[0].buffers[bi];
+        buf.history_loaded = true;
+        buf.oldest_history_ts = Some("2026-01-01T10:00:00.000Z".into());
+        buf.push(Line {
+            msgid: Some("r1".into()),
+            reply_to: Some("p0".into()),
+            kind: LineKind::Message,
+            from: "bob".into(),
+            ts_iso: Some("2026-01-01T10:00:00.000Z".into()),
+            ..Line::system("yes, exactly")
+        });
+        buf.selection = Some("r1".into());
+        app.select_buffer(0, bi);
+        (app, rx, bi)
+    }
+
+    #[test]
+    fn original_by_msgid_goes_to_reply_context_not_the_timeline() {
+        let (mut app, mut rx, bi) = orphan_reply_app();
+        app.networks[0].isupport.msgreftypes = vec!["msgid".into(), "timestamp".into()];
+        app.fetch_original();
+        assert_eq!(raw_cmds(&mut rx), vec!["CHATHISTORY AROUND #c msgid=p0 5"]);
+        hist_msg(&mut app, "#c", "alice", "before", "2026-01-01T09:00:00.000Z", "x");
+        hist_msg(&mut app, "#c", "alice", "the original", "2026-01-01T09:01:00.000Z", "p0");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#c".into(), end_of_history: false, count: 2, newest_ts: None });
+        let buf = &app.networks[0].buffers[bi];
+        assert_eq!(buf.lines.len(), 1, "no island in the timeline");
+        assert_eq!(buf.reply_context["p0"].text, "the original");
+        assert!(!buf.history_loading);
+    }
+
+    #[test]
+    fn original_on_a_timestamp_only_server_pages_back() {
+        let (mut app, mut rx, bi) = orphan_reply_app();
+        app.fetch_original();
+        assert!(app.networks[0].buffers[bi].request_older);
+        app.request_older_history();
+        assert!(matches!(take_history_request_any(&mut rx), Some(Outgoing::ChatHistoryBefore { .. })));
+        // A full page without the original: page again.
+        hist_msg(&mut app, "#c", "alice", "older", "2026-01-01T08:00:00.000Z", "y");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#c".into(), end_of_history: false, count: HISTORY_LIMIT, newest_ts: None });
+        assert!(app.networks[0].buffers[bi].request_older);
+        assert_eq!(app.networks[0].buffers[bi].seek_original.as_ref().map(|s| s.1), Some(3));
+        // The next page carries it.
+        app.request_older_history();
+        assert!(matches!(take_history_request_any(&mut rx), Some(Outgoing::ChatHistoryBefore { .. })));
+        hist_msg(&mut app, "#c", "alice", "the original", "2026-01-01T07:00:00.000Z", "p0");
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#c".into(), end_of_history: false, count: HISTORY_LIMIT, newest_ts: None });
+        let buf = &app.networks[0].buffers[bi];
+        assert!(buf.lines.iter().any(|l| l.msgid.as_deref() == Some("p0")));
+        assert!(buf.seek_original.is_none());
+        assert!(!buf.request_older, "found: stop paging");
+    }
+
+    #[test]
+    fn original_seek_survives_an_all_duplicate_page() {
+        let (mut app, _rx, bi) = orphan_reply_app();
+        app.fetch_original();
+        app.request_older_history();
+        app.apply_event(0, Event::ChatHistoryBatchEnd { target: "#c".into(), end_of_history: false, count: HISTORY_LIMIT, newest_ts: None });
+        assert!(app.networks[0].buffers[bi].request_older, "keeps paging past a page with nothing new");
+    }
+
+    #[test]
+    fn refused_around_does_not_end_paging() {
+        let (mut app, _rx, bi) = orphan_reply_app();
+        app.networks[0].isupport.msgreftypes = vec!["msgid".into()];
+        app.fetch_original();
+        app.apply_event(0, Event::ChatHistoryFailed);
+        let buf = &app.networks[0].buffers[bi];
+        assert!(!buf.history_loading && !buf.history_exhausted);
+    }
+
+    fn take_history_request_any(out_rx: &mut mpsc::Receiver<Outgoing>) -> Option<Outgoing> {
+        std::iter::from_fn(|| out_rx.try_recv().ok()).find(|o| {
+            matches!(o, Outgoing::ChatHistoryBefore { .. } | Outgoing::ChatHistoryAfter { .. } | Outgoing::ChatHistoryLatest { .. })
+        })
     }
 
     #[test]

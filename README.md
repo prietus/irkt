@@ -115,13 +115,20 @@ Add more `[[network]]` blocks to connect to multiple networks.
 ## Commands
 
 `/join /part /msg /query /me /nick /topic /whois /away /mode /kick /invite`
-`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /notify /theme /lang /highlight /ignore /dim /mute /unmute /pin /unpin /upload /react /reply /redact /quit`
+`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /notify /theme /lang /highlight /ignore /dim /mute /unmute /pin /unpin /upload /react /reply /redact /original /rawlog /quit`
 
 `/mute [target]` silences a conversation's notifications and `/pin [target]`
 lists it first in the sidebar (both default to the current buffer). An
 invitation lands in the status buffer; a bare `/join` accepts the latest one.
 
-`/ignore [add|del|list|clear] <nick>…` hides a nick's messages entirely;
+A reply whose original predates the loaded scrollback shows a dim
+`↪ reply to an earlier message` hint: select it (`Alt+↑/↓`) and run `/original`
+to fetch it (by msgid via `CHATHISTORY AROUND` where the server allows, else by
+paging back). `/rawlog` toggles a `*raw*` buffer with the network's wire
+traffic (passwords redacted).
+
+`/ignore [add|del|list|clear] <nick>…` hides a nick's messages entirely (kept,
+so `/ignore del` brings them back; on soju it also blocks them there);
 `/dim [add|del|list|clear] <nick>…` is a softer version that still shows them
 but dimmed (legible, just muted). A bare `/ignore <nick>` or `/dim <nick>` is
 shorthand for `add`. Both lists persist to `state.toml` and merge with

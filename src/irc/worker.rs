@@ -187,6 +187,8 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx:
 
     // Reconnect loop. Each iteration is one connection attempt.
     let mut attempt: u32 = 0;
+    // `/rawlog`: mirror wire traffic to the UI (survives reconnects).
+    let mut raw_log = false;
     loop {
         diag_log(
             &cfg.name,
@@ -268,6 +270,9 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx:
                 tokio::select! {
                     incoming = stream.next() => match incoming {
                         Some(Ok(msg)) => {
+                            if raw_log {
+                                let _ = out.send(Event::Wire { outgoing: false, line: redact_wire(&msg.to_string()) });
+                            }
                             if auth_phase == AuthPhase::Done {
                                 if let Some(updated) = handle_cap_notify(&msg, &sender, &mut cap_state) {
                                     let _ = out.send(Event::CapsAcked(updated));
@@ -406,7 +411,12 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx:
                         None => break 'attempt AttemptOutcome::Recoverable("server closed connection".into()),
                     },
                     outgoing = orx.recv() => {
+                        // Everything below sends through this, so `/rawlog`
+                        // sees the user's traffic. (Registration and SASL
+                        // don't: they carry credentials.)
+                        let sender = WireSender { inner: &sender, log: raw_log.then_some(&out) };
                         match outgoing {
+                            Some(Outgoing::RawLog(on)) => raw_log = on,
                             Some(Outgoing::Privmsg { target, text }) => { let _ = sender.send_privmsg(&target, &text); }
                             Some(Outgoing::PrivmsgReply { target, text, reply_to_msgid }) => {
                                 let _ = sender.send(Message {
@@ -808,6 +818,57 @@ fn handle_auth_msg(
             _ => AuthOutcome::Pending,
         },
         _ => AuthOutcome::Pending,
+    }
+}
+
+/// `Sender` with the subset of its API the outgoing loop uses, mirroring each
+/// message to `/rawlog` when `log` is set.
+struct WireSender<'a> {
+    inner: &'a Sender,
+    log: Option<&'a mpsc::UnboundedSender<Event>>,
+}
+
+impl WireSender<'_> {
+    fn send<M: Into<Message>>(&self, msg: M) -> irc::error::Result<()> {
+        let msg: Message = msg.into();
+        if let Some(out) = self.log {
+            let _ = out.send(Event::Wire { outgoing: true, line: redact_wire(&msg.to_string()) });
+        }
+        self.inner.send(msg)
+    }
+
+    fn send_privmsg(&self, target: &str, text: &str) -> irc::error::Result<()> {
+        self.send(Command::PRIVMSG(target.to_string(), text.to_string()))
+    }
+
+    fn send_join(&self, channel: &str) -> irc::error::Result<()> {
+        self.send(Command::JOIN(channel.to_string(), None, None))
+    }
+}
+
+/// A wire line for `/rawlog`, minus its line ending and with secrets masked:
+/// PASS/OPER/AUTHENTICATE parameters and NickServ IDENTIFY/REGISTER.
+fn redact_wire(line: &str) -> String {
+    let line = line.trim_end_matches(['\r', '\n']);
+    // Skip tags and prefix to find the command word.
+    let mut rest = line;
+    let mut head_len = 0;
+    for _ in 0..2 {
+        if rest.starts_with('@') || rest.starts_with(':') {
+            let cut = rest.find(' ').map_or(rest.len(), |i| i + 1);
+            head_len += cut;
+            rest = &rest[cut..];
+        }
+    }
+    let cmd = rest.split(' ').next().unwrap_or("").to_ascii_uppercase();
+    let upper = rest.to_ascii_uppercase();
+    let secret = matches!(cmd.as_str(), "PASS" | "OPER" | "AUTHENTICATE")
+        || (cmd == "PRIVMSG"
+            && (upper.contains(" :IDENTIFY") || upper.contains(" :REGISTER") || upper.contains(" :GHOST")));
+    if secret {
+        format!("{}{} <redacted>", &line[..head_len], rest.split(' ').take(if cmd == "PRIVMSG" { 2 } else { 1 }).collect::<Vec<_>>().join(" "))
+    } else {
+        line.to_string()
     }
 }
 
@@ -1499,6 +1560,13 @@ fn apply_isupport_token(isupport: &mut ISupport, tok: &str) -> bool {
                 return true;
             }
         }
+        "MSGREFTYPES" => {
+            let new: Vec<String> = value.unwrap_or("").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+            if isupport.msgreftypes != new {
+                isupport.msgreftypes = new;
+                return true;
+            }
+        }
         "CLIENTTAGDENY" => {
             let mut deny_all = false;
             let mut deny: HashSet<String> = HashSet::new();
@@ -1701,6 +1769,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn rawlog_redacts_secrets() {
+        assert_eq!(redact_wire("PASS hunter2\r\n"), "PASS <redacted>");
+        assert_eq!(redact_wire("AUTHENTICATE dXNlcgB1c2VyAHB3"), "AUTHENTICATE <redacted>");
+        assert_eq!(redact_wire("OPER admin s3cret"), "OPER <redacted>");
+        assert_eq!(redact_wire("PRIVMSG NickServ :IDENTIFY me pw"), "PRIVMSG NickServ <redacted>");
+        assert_eq!(redact_wire("@label=1 PRIVMSG NickServ :identify pw"), "@label=1 PRIVMSG NickServ <redacted>");
+        // Ordinary traffic is untouched (minus the line ending).
+        assert_eq!(redact_wire(":a!b@c PRIVMSG #x :hello there\r\n"), ":a!b@c PRIVMSG #x :hello there");
+        assert_eq!(redact_wire("PRIVMSG #x :how do I identify with nickserv?"), "PRIVMSG #x :how do I identify with nickserv?");
+    }
 
     fn translated(line: &str) -> Vec<Event> {
         let msg: Message = line.parse().unwrap();

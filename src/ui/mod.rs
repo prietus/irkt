@@ -238,6 +238,7 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     let unfurl = app.link_previews;
     let hide_join_part = app.hide_join_part;
     let dimmed = app.dimmed_nicks.clone();
+    let ignored = app.ignored_nicks.clone();
     let img_cols = (body.width).min(IMAGE_MAX_COLS).max(1);
 
     // First, ensure a fetch is in flight for any URL in this buffer. Whether
@@ -297,7 +298,9 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         for (i, l) in lines.iter().enumerate() {
             if let Some(pid) = &l.reply_to {
                 if let Some(&pidx) = msgid_idx.get(pid.as_str()) {
-                    if pidx < i {
+                    // Replies to a hidden (ignored) message stand on their own
+                    // instead of vanishing with it.
+                    if pidx < i && !is_hidden(&lines[pidx], &ignored) {
                         children.entry(pidx).or_default().push(i);
                         is_child[i] = true;
                     }
@@ -317,11 +320,14 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             unfurl,
             images: &app.images,
             dimmed: &dimmed,
+            ignored: &ignored,
+            msgids: &msgid_idx,
+            reply_context: &buf.reply_context,
         };
         let read_marker = buf.read_marker.as_deref();
         let mut marker_drawn = false;
         for i in 0..lines.len() {
-            if is_child[i] {
+            if is_child[i] || is_hidden(&lines[i], &ignored) {
                 continue;
             }
             // Hide join/part/quit churn when /joins is off.
@@ -473,6 +479,32 @@ fn place_escape(buf: &mut ratatui::buffer::Buffer, rect: Rect, seq: &str) {
     }
 }
 
+/// The dim `↪ nick: text` (or "earlier message") row above an orphan reply,
+/// cut to one line.
+fn orphan_reply_header(orig: Option<&Line>, width: usize, t: &Theme) -> RLine<'static> {
+    let indent = "      ";
+    let (who, text) = match orig {
+        Some(o) => (format!("{}: ", o.from), o.text.clone()),
+        None => (String::new(), "reply to an earlier message — /original".to_string()),
+    };
+    let room = width.saturating_sub(indent.width() + 2 + who.width());
+    let mut shown = String::new();
+    for ch in text.chars() {
+        if shown.width() + ch.to_string().width() > room.saturating_sub(1) {
+            shown.push('…');
+            break;
+        }
+        shown.push(ch);
+    }
+    let dim = Style::default().fg(t.dim);
+    let mut spans = vec![Span::styled(format!("{indent}↪ "), dim)];
+    if orig.is_some() {
+        spans.push(Span::styled(who, Style::default().fg(t.nick(&orig.unwrap().from))));
+    }
+    spans.push(Span::styled(shown, dim.add_modifier(Modifier::ITALIC)));
+    RLine::from(spans)
+}
+
 /// A full-width "── new messages ──" rule marking the read boundary.
 fn read_marker_row(width: usize, t: &Theme) -> RLine<'static> {
     let label = " new messages ";
@@ -501,6 +533,18 @@ struct RenderCtx<'a> {
     images: &'a crate::images::Images,
     /// Nicks whose lines render dimmed (soft ignore via `/dim`).
     dimmed: &'a [String],
+    /// Nicks whose messages are hidden (`/ignore`).
+    ignored: &'a [String],
+    /// msgid -> line index, to spot replies whose original isn't loaded.
+    msgids: &'a std::collections::HashMap<&'a str, usize>,
+    /// Originals fetched with `/original`, by msgid.
+    reply_context: &'a std::collections::HashMap<String, Line>,
+}
+
+/// A message from an ignored nick: kept in the buffer, not drawn.
+fn is_hidden(line: &Line, ignored: &[String]) -> bool {
+    matches!(line.kind, LineKind::Message | LineKind::Action)
+        && ignored.iter().any(|n| n.eq_ignore_ascii_case(&line.from))
 }
 
 /// Render one message and, recursively, its threaded replies nested beneath it.
@@ -522,6 +566,14 @@ fn push_message(
     } else {
         render_reply_child(line, depth, ctx.width, t)
     };
+    // A reply whose original isn't in the scrollback: quote it if `/original`
+    // fetched it, else say how to.
+    if depth == 0
+        && let Some(pid) = line.reply_to.as_deref()
+        && !ctx.msgids.contains_key(pid)
+    {
+        these.insert(0, orphan_reply_header(ctx.reply_context.get(pid), ctx.width, t));
+    }
     // Soft-ignore: recolor a dimmed nick's whole line to the muted tone and
     // drop the bold, so it stays legible but recedes (set with `/dim`).
     if ctx.dimmed.iter().any(|n| n.eq_ignore_ascii_case(&line.from)) {
@@ -619,7 +671,7 @@ fn push_message(
     // Nested replies (depth-capped as a guard against pathological chains).
     if depth < 8 {
         if let Some(kids) = ctx.children.get(&idx) {
-            for &k in kids {
+            for &k in kids.iter().filter(|&&k| !is_hidden(&ctx.lines[k], ctx.ignored)) {
                 push_message(ctx, k, depth + 1, rows, placements, sel_range, row_msgids);
             }
         }
@@ -1376,6 +1428,76 @@ mod render_tests {
         let chat_x = app.sidebar_w + 5;
         crate::keys::click(&mut app, chat_x, y);
         assert_eq!((app.active.net, app.active.buf), (0, 0), "chat-area click is ignored");
+    }
+
+    #[test]
+    fn orphan_reply_shows_a_hint_then_the_fetched_original() {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        app.networks[0].buffers[bi].push(Line {
+            time: "12:00".into(), kind: LineKind::Message, from: "bob".into(),
+            text: "agreed".into(), msgid: Some("r1".into()), highlight: false,
+            reply_to: Some("p0".into()), ts_iso: None,
+        });
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = false;
+        app.show_sidebar = false;
+        let screen = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(70, 8)).unwrap();
+            term.draw(|f| { draw(f, app); }).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(screen(&mut app).contains("/original"));
+        app.networks[0].buffers[bi].reply_context.insert("p0".into(), Line {
+            kind: LineKind::Message, from: "alice".into(), ..Line::system("ship it on friday?")
+        });
+        let s = screen(&mut app);
+        assert!(s.contains("alice: ship it on friday?") && !s.contains("/original"));
+    }
+
+    #[test]
+    fn ignored_lines_are_hidden_until_unignored() {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        for (who, txt) in [("alice", "visible line"), ("troll", "hidden line")] {
+            app.networks[0].buffers[bi].push(Line {
+                time: "12:00".into(), kind: LineKind::Message, from: who.into(),
+                text: txt.into(), msgid: None, highlight: false, reply_to: None, ts_iso: None,
+            });
+        }
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = false;
+        app.show_sidebar = false;
+        let screen = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
+            term.draw(|f| { draw(f, app); }).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        app.ignored_nicks = vec!["troll".into()];
+        let s = screen(&mut app);
+        assert!(s.contains("visible line") && !s.contains("hidden line"));
+        app.ignored_nicks.clear();
+        assert!(screen(&mut app).contains("hidden line"), "unignore is retroactive");
     }
 
     #[test]

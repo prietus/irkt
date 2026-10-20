@@ -31,6 +31,9 @@ pub struct ISupport {
     /// `BOT=<letter>` — the user mode a client sets to flag itself as a bot
     /// (IRCv3 bot-mode). `None` if the server doesn't advertise it.
     pub bot_mode: Option<char>,
+    /// `MSGREFTYPES=<a,b>`: how CHATHISTORY may reference a message
+    /// (`msgid`, `timestamp`). soju only takes timestamps.
+    pub msgreftypes: Vec<String>,
 }
 
 impl ISupport {
@@ -89,6 +92,8 @@ pub struct MsgMeta {
 #[derive(Clone)]
 #[allow(dead_code)] // full IRCv3 command surface; some variants are wired incrementally
 pub enum Outgoing {
+    /// Mirror wire traffic to the UI (`/rawlog`) or stop.
+    RawLog(bool),
     Privmsg { target: String, text: String },
     PrivmsgReply { target: String, text: String, reply_to_msgid: String },
     Action { target: String, text: String },
@@ -175,6 +180,8 @@ pub enum Event {
     },
     /// Registration finished (end of MOTD): MONITOR/METADATA can be sent.
     Registered,
+    /// A raw wire line for `/rawlog` (secrets redacted).
+    Wire { outgoing: bool, line: String },
     /// draft/metadata-2: `METADATA <target> <key> <vis> [<value>]`, or
     /// `RPL_KEYVALUE` for our own SET. No value means the key was cleared.
     Metadata { target: String, key: String, value: Option<String> },
