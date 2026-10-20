@@ -988,9 +988,46 @@ fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
             row.push(Span::styled(" 🤖", Style::default().fg(t.dim)));
         }
         lines.push(RLine::from(row));
+        // draft/metadata-2 profile: display name and pronouns on a dim second
+        // row, each only when it adds something beyond the nick.
+        if let Some(sub) = member_subtitle(net, &m.nick, inner.width as usize) {
+            let y = inner.y + lines.len() as u16;
+            if y < inner.y + inner.height {
+                hits.push((y, m.nick.clone()));
+            }
+            lines.push(RLine::from(Span::styled(sub, Style::default().fg(t.dim).add_modifier(Modifier::ITALIC))));
+        }
     }
     f.render_widget(Paragraph::new(lines), inner);
     app.member_rows = hits;
+}
+
+/// ` display name · pronouns`, cut to `width` columns, or `None` when the
+/// member published neither (or only their nick).
+fn member_subtitle(net: &Network, nick: &str, width: usize) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let parts: Vec<&str> = ["display-name", "pronouns"]
+        .iter()
+        .filter_map(|k| net.profile(nick, k))
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case(nick) && seen.insert(v.to_lowercase()))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let full = format!(" {}", parts.join(" · "));
+    if full.width() <= width {
+        return Some(full);
+    }
+    let mut out = String::new();
+    for ch in full.chars() {
+        if out.width() + ch.to_string().width() + 1 > width {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    Some(out)
 }
 
 fn prefix_rank(prefixes: &str) -> u8 {
@@ -1463,6 +1500,22 @@ mod render_tests {
         });
         let s = screen(&mut app);
         assert!(s.contains("alice: ship it on friday?") && !s.contains("/original"));
+    }
+
+    #[test]
+    fn member_subtitle_shows_profile_beyond_the_nick() {
+        let (out, _r) = mpsc::channel(8);
+        std::mem::forget(_r);
+        let mut net = Network::new(0, net_cfg(), out);
+        assert!(member_subtitle(&net, "alice", 20).is_none());
+        let p = net.user_meta.entry("alice".into()).or_default();
+        p.insert("display-name".into(), "Alice".into()); // same as the nick: skipped
+        p.insert("pronouns".into(), "she/her".into());
+        assert_eq!(member_subtitle(&net, "Alice", 20).as_deref(), Some(" she/her"));
+        net.user_meta.get_mut("alice").unwrap().insert("display-name".into(), "Alice Liddell".into());
+        assert_eq!(member_subtitle(&net, "alice", 40).as_deref(), Some(" Alice Liddell · she/her"));
+        let cut = member_subtitle(&net, "alice", 10).unwrap();
+        assert!(cut.ends_with('…') && cut.width() <= 10);
     }
 
     #[test]

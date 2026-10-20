@@ -2432,6 +2432,10 @@ mod tests {
         assert_eq!(app.networks[0].profile("alice2", "pronouns"), Some("she/her"));
         md(&mut app, "alice2", "pronouns", None);
         assert!(app.networks[0].profile("alice2", "pronouns").is_none());
+        // `*` is our own nick.
+        app.networks[0].nick = "terraflops".into();
+        md(&mut app, "*", "pronouns", Some("he/him"));
+        assert_eq!(app.networks[0].profile("terraflops", "pronouns"), Some("he/him"));
     }
 
     #[test]

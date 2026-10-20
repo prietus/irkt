@@ -111,6 +111,14 @@ impl App {
     pub(super) fn on_metadata(&mut self, ni: usize, target: &str, key: &str, value: Option<&str>) {
         let key = key.to_lowercase();
         let net = &mut self.networks[ni];
+        // `*` is "me": a reply to our own `METADATA * SET <profile key>`.
+        let own;
+        let target = if target == "*" && PROFILE_KEYS.contains(&key.as_str()) {
+            own = net.nick.clone();
+            own.as_str()
+        } else {
+            target
+        };
         if !valid_target(target) {
             return;
         }
