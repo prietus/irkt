@@ -363,9 +363,7 @@ impl App {
                     self.set_status("usage: /raw <line>");
                     return;
                 }
-                let mut parts = rest.split_whitespace();
-                let cmd = parts.next().unwrap().to_string();
-                let args = parts.map(str::to_string).collect();
+                let (cmd, args) = parse_raw_line(rest);
                 let _ = self.networks[ni].out.try_send(Outgoing::Raw { cmd, args });
             }
             "names" => {
@@ -992,5 +990,41 @@ impl App {
         let chan = self.active_channel();
         let reason = if rest.is_empty() { None } else { Some(rest.to_string()) };
         (chan, reason)
+    }
+}
+
+/// Split a `/raw` line into command and parameters the IRC way: from the
+/// first word starting with `:`, the rest of the line (colon dropped) is one
+/// trailing parameter, spaces and all. Without this, `:Carlos` was sent as a
+/// parameter of its own and the serializer prefixed another colon.
+fn parse_raw_line(line: &str) -> (String, Vec<String>) {
+    let mut args = Vec::new();
+    let mut rest = line.trim_start();
+    while !rest.is_empty() {
+        if let Some(trailing) = rest.strip_prefix(':') {
+            args.push(trailing.to_string());
+            break;
+        }
+        let end = rest.find(' ').unwrap_or(rest.len());
+        args.push(rest[..end].to_string());
+        rest = rest[end..].trim_start();
+    }
+    let cmd = if args.is_empty() { String::new() } else { args.remove(0) };
+    (cmd, args)
+}
+
+#[cfg(test)]
+mod raw_line_tests {
+    use super::parse_raw_line;
+
+    #[test]
+    fn trailing_parameter_keeps_spaces_and_loses_its_colon() {
+        let (cmd, args) = parse_raw_line("METADATA * SET display-name :Carlos A.");
+        assert_eq!(cmd, "METADATA");
+        assert_eq!(args, vec!["*", "SET", "display-name", "Carlos A."]);
+        let (cmd, args) = parse_raw_line("WHOIS  bob");
+        assert_eq!((cmd.as_str(), args), ("WHOIS", vec!["bob".to_string()]));
+        // An empty trailing parameter survives (e.g. clearing a value).
+        assert_eq!(parse_raw_line("TOPIC #c :").1, vec!["#c", ""]);
     }
 }

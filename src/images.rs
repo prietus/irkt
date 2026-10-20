@@ -141,6 +141,19 @@ impl Images {
         self.map.insert(msg.url, st);
     }
 
+    /// A pixel graphics protocol (Kitty / iTerm2 / Sixel), not halfblocks.
+    pub fn graphics_protocol(&self) -> bool {
+        is_graphics(&self.picker)
+    }
+
+    /// `url` has been fetched and decoded into something drawable.
+    pub fn is_ready(&self, url: &str) -> bool {
+        matches!(
+            self.map.get(url),
+            Some(ImageState::Ready { .. } | ImageState::Anim { .. } | ImageState::Native { .. })
+        )
+    }
+
     /// Whether images go out as iTerm2 `OSC 1337` escapes.
     pub fn is_iterm2(&self) -> bool {
         matches!(self.picker.protocol_type(), ratatui_image::picker::ProtocolType::Iterm2)

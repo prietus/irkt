@@ -403,7 +403,6 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
     }
 
     // Draw any images whose reserved rows are within the visible window.
-    let tmux = app.images.tmux;
     for (rstart, h, cols, url) in placements {
         let rend = rstart + h as usize;
         if rend <= start || rstart >= end {
@@ -426,39 +425,46 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         let indent = IMAGE_INDENT.min(body.width.saturating_sub(1));
         let w = cols.min(body.width.saturating_sub(indent));
         let rect = Rect { x: body.x + indent, y, width: w, height };
-        // Animated images render like stills but through the current frame's
-        // protocol; note them as visible so the frame clock advances/redraws them.
-        if matches!(app.images.map.get(&url), Some(ImageState::Anim { .. })) {
-            app.visible_anims.push(url.clone());
+        draw_image(f, rect, &url, app);
+    }
+}
+
+/// Draw the decoded image for `url` into `rect`, whatever its kind; a no-op
+/// while it's still loading or isn't an image.
+fn draw_image(f: &mut Frame, rect: Rect, url: &str, app: &mut App) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    // Animated images render like stills but through the current frame's
+    // protocol; note them as visible so the frame clock advances/redraws them.
+    if matches!(app.images.map.get(url), Some(ImageState::Anim { .. })) {
+        app.visible_anims.push(url.to_string());
+    }
+    let tmux = app.images.tmux;
+    let widget = StatefulImage::default().resize(Resize::Fit(None));
+    match app.images.map.get_mut(url) {
+        Some(ImageState::Ready { proto, .. }) => {
+            f.render_stateful_widget(widget, rect, proto);
         }
-        let widget = StatefulImage::default().resize(Resize::Fit(None));
-        match app.images.map.get_mut(&url) {
-            Some(ImageState::Ready { proto, .. }) => {
+        Some(ImageState::Anim { frames, idx, .. }) => {
+            if let Some(proto) = frames.get_mut(*idx) {
                 f.render_stateful_widget(widget, rect, proto);
             }
-            Some(ImageState::Anim { frames, idx, .. }) => {
-                if let Some(proto) = frames.get_mut(*idx) {
-                    f.render_stateful_widget(widget, rect, proto);
-                }
-            }
-            Some(ImageState::Native { b64, len, escape, .. }) => {
-                if rect.width == 0 || rect.height == 0 {
-                    continue;
-                }
-                // Built once per size: the escape is the whole GIF, and an
-                // unchanged cell symbol is never re-sent (see crate::draw), so
-                // iTerm2 receives it once and plays it on its own.
-                let size = (rect.width, rect.height);
-                if escape.as_ref().is_none_or(|(s, _)| *s != size) {
-                    let seq = crate::images::iterm2_escape(b64, *len, size.0, size.1, tmux);
-                    *escape = Some((size, seq));
-                }
-                if let Some((_, seq)) = escape {
-                    place_escape(f.buffer_mut(), rect, seq);
-                }
-            }
-            _ => {}
         }
+        Some(ImageState::Native { b64, len, escape, .. }) => {
+            // Built once per size: the escape is the whole GIF, and an
+            // unchanged cell symbol is never re-sent (see crate::draw), so
+            // iTerm2 receives it once and plays it on its own.
+            let size = (rect.width, rect.height);
+            if escape.as_ref().is_none_or(|(s, _)| *s != size) {
+                let seq = crate::images::iterm2_escape(b64, *len, size.0, size.1, tmux);
+                *escape = Some((size, seq));
+            }
+            if let Some((_, seq)) = escape {
+                place_escape(f.buffer_mut(), rect, seq);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -498,8 +504,8 @@ fn orphan_reply_header(orig: Option<&Line>, width: usize, t: &Theme) -> RLine<'s
     }
     let dim = Style::default().fg(t.dim);
     let mut spans = vec![Span::styled(format!("{indent}↪ "), dim)];
-    if orig.is_some() {
-        spans.push(Span::styled(who, Style::default().fg(t.nick(&orig.unwrap().from))));
+    if let Some(o) = orig {
+        spans.push(Span::styled(who, Style::default().fg(t.nick(&o.from))));
     }
     spans.push(Span::styled(shown, dim.add_modifier(Modifier::ITALIC)));
     RLine::from(spans)
@@ -953,6 +959,26 @@ fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
         pa.cmp(&pb).then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
     });
 
+    // draft/metadata-2 avatars, fetched only with inline images on (like
+    // link previews, fetching reveals our IP to the host) and drawn only with
+    // a real graphics protocol: a 2x1-cell picture is about square.
+    let show_avatars = app.inline_images && app.images.graphics_protocol();
+    let avatar_of = |nick: &str| -> Option<String> {
+        net.profile(nick, "avatar")
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .map(str::to_string)
+    };
+    let wanted: Vec<String> = if show_avatars {
+        sorted.iter().filter_map(|m| avatar_of(&m.nick)).collect()
+    } else {
+        Vec::new()
+    };
+    // Reserve the avatar column for everyone once any avatar is ready, so
+    // nicks stay aligned.
+    let slot = wanted.iter().any(|u| app.images.is_ready(u));
+    // (screen row, avatar URL) to draw once the text is down.
+    let mut avatars: Vec<(u16, String)> = Vec::new();
+
     // Clickable rows, recorded for mouse hit-testing (the Paragraph doesn't
     // wrap, so line index `i` lands on screen row `inner.y + i`).
     let mut hits: Vec<(u16, String)> = Vec::new();
@@ -979,10 +1005,16 @@ fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             Style::default().fg(t.nick(&m.nick))
         };
-        let mut row = vec![
-            Span::styled(prefix.to_string(), Style::default().fg(pcolor)),
-            Span::styled(m.nick.clone(), nick_style),
-        ];
+        let mut row = vec![Span::styled(prefix.to_string(), Style::default().fg(pcolor))];
+        if slot {
+            row.push(Span::raw("   "));
+            if let Some(url) = avatar_of(&m.nick)
+                && y < inner.y + inner.height
+            {
+                avatars.push((y, url));
+            }
+        }
+        row.push(Span::styled(m.nick.clone(), nick_style));
         // IRCv3 bot-mode badge (learned from the channel WHO).
         if m.is_bot {
             row.push(Span::styled(" 🤖", Style::default().fg(t.dim)));
@@ -1000,6 +1032,13 @@ fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
     }
     f.render_widget(Paragraph::new(lines), inner);
     app.member_rows = hits;
+    for url in &wanted {
+        app.images.ensure(url);
+    }
+    for (y, url) in avatars {
+        let rect = Rect { x: inner.x + 1, y, width: 2.min(inner.width.saturating_sub(1)), height: 1 };
+        draw_image(f, rect, &url, app);
+    }
 }
 
 /// ` display name · pronouns`, cut to `width` columns, or `None` when the
@@ -1500,6 +1539,51 @@ mod render_tests {
         });
         let s = screen(&mut app);
         assert!(s.contains("alice: ship it on friday?") && !s.contains("/original"));
+    }
+
+    #[test]
+    fn member_avatar_is_drawn_before_the_nick() {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let mut images = Images::new(Picker::from_fontsize((14, 30)), img_tx);
+        images.picker.set_protocol_type(ratatui_image::picker::ProtocolType::Iterm2);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        app.networks[0].members.insert("#chan".into(), vec![
+            crate::irc::MemberEntry { nick: "alice".into(), prefixes: String::new(), userhost: None, is_bot: false, is_away: false },
+            crate::irc::MemberEntry { nick: "bob".into(), prefixes: String::new(), userhost: None, is_bot: false, is_away: false },
+        ]);
+        let url = "https://example.com/a.png".to_string();
+        app.networks[0].user_meta.entry("alice".into()).or_default().insert("avatar".into(), url.clone());
+        let proto = app.images.picker.new_resize_protocol(image::DynamicImage::new_rgba8(4, 4));
+        app.images.map.insert(url, ImageState::Ready { proto, w: 4, h: 4 });
+        app.inline_images = true;
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_sidebar = false;
+        app.show_members = true;
+
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
+        let buf = term.backend().buffer();
+        let row_of = |needle: &str| {
+            (0..buf.area.height).find_map(|y| {
+                let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                line.find(needle).map(|_| y)
+            })
+        };
+        let y = row_of("alice").expect("alice listed");
+        let has_escape = (0..buf.area.width).any(|x| buf[(x, y)].symbol().contains("1337"));
+        assert!(has_escape, "an iTerm2 image escape sits on alice's row");
+        // bob has no avatar but keeps the column, so nicks line up.
+        let col = |y: u16, name: &str| {
+            let line: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' ')).collect();
+            line.find(name)
+        };
+        let yb = row_of("bob").unwrap();
+        assert_eq!(col(y, "alice"), col(yb, "bob"));
     }
 
     #[test]
