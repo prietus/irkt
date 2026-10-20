@@ -39,6 +39,9 @@ const WANT_EXTRA_CAPS: &[&str] = &[
     "soju.im/no-implicit-names",
     // Tier-2 protocol plumbing:
     "cap-notify",
+    // AWAY/ACCOUNT/CHGHOST for MONITORed nicks we share no channel with.
+    "extended-monitor",
+    "draft/extended-monitor",
     "labeled-response",
     // FAIL/WARN/NOTE replies (shown as notices; FAIL CHATHISTORY ends loading).
     "standard-replies",
@@ -52,6 +55,8 @@ const WANT_EXTRA_CAPS: &[&str] = &[
     "draft/message-redaction",
     "draft/event-playback",
     "draft/sasl-ir",
+    // Per-target soju flags (blocked/muted/pinned) and user profiles.
+    "draft/metadata-2",
 ];
 
 /// Append a line to `irkt.log` next to `config.toml`, timestamped in local
@@ -257,6 +262,7 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx:
             let mut cap_state = CapState::default();
             let mut batches: HashMap<String, BatchInfo> = HashMap::new();
             let mut isupport = ISupport::default();
+            let mut registered = false;
 
             loop {
                 tokio::select! {
@@ -311,6 +317,28 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx:
                                 if is_auth_wire(&msg) {
                                     continue;
                                 }
+                            }
+                            // RPL_METADATASYNCLATER <me> <target> [<retry-after>]:
+                            // ask again later (bounded so a bad value can't stall).
+                            if let Command::Raw(ref cmd, ref args) = msg.command {
+                                if cmd == "774" && args.len() >= 2 {
+                                    let target = args[1].clone();
+                                    let secs = args.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(5).min(60);
+                                    let s = sender.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                                        let _ = s.send(Command::Raw("METADATA".into(), vec![target, "SYNC".into()]));
+                                    });
+                                }
+                            }
+                            // End of MOTD (or no MOTD) marks registration done:
+                            // the point where MONITOR/METADATA may be sent.
+                            // `Connected` fires earlier, right after CAP END.
+                            if !registered
+                                && matches!(msg.command, Command::Response(Response::RPL_ENDOFMOTD | Response::ERR_NOMOTD, _))
+                            {
+                                registered = true;
+                                let _ = out.send(Event::Registered);
                             }
                             // Count every message the server puts in a chathistory
                             // batch (events too, under event-playback): the page
@@ -442,18 +470,14 @@ async fn run(mut cfg: NetworkConfig, out: mpsc::UnboundedSender<Event>, mut orx:
                                 let _ = sender.send(Command::Raw("SETNAME".into(), vec![realname]));
                             }
                             Some(Outgoing::Monitor(cmd)) => {
-                                let (op, payload) = match cmd {
-                                    MonitorCmd::Add(t) => ("+", Some(t.join(","))),
-                                    MonitorCmd::Del(t) => ("-", Some(t.join(","))),
-                                    MonitorCmd::Clear => ("C", None),
+                                let (op, targets) = match cmd {
+                                    MonitorCmd::Add(t) => ("+", t),
+                                    MonitorCmd::Del(t) => ("-", t),
                                 };
-                                let argv = match payload {
-                                    Some(p) if p.is_empty() => None,
-                                    Some(p) => Some(vec![op.to_string(), p]),
-                                    None => Some(vec![op.to_string()]),
-                                };
-                                if let Some(argv) = argv {
-                                    let _ = sender.send(Command::Raw("MONITOR".into(), argv));
+                                // One line could overflow 512 bytes with a long
+                                // list: split the targets across several.
+                                for list in monitor_chunks(&targets) {
+                                    let _ = sender.send(Command::Raw("MONITOR".into(), vec![op.to_string(), list]));
                                 }
                             }
                             Some(Outgoing::React { target, msgid, emoji }) => {
@@ -785,6 +809,22 @@ fn handle_auth_msg(
         },
         _ => AuthOutcome::Pending,
     }
+}
+
+/// Comma-joined MONITOR target lists, each short enough (~400 bytes) to keep
+/// `MONITOR + <list>` well inside the 512-byte line limit.
+fn monitor_chunks(targets: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in targets.iter().filter(|t| !t.is_empty()) {
+        match out.last_mut() {
+            Some(cur) if cur.len() + 1 + t.len() <= 400 => {
+                cur.push(',');
+                cur.push_str(t);
+            }
+            _ => out.push(t.clone()),
+        }
+    }
+    out
 }
 
 /// Upgrade SASL PLAIN to SCRAM-SHA-256 when the server lists it (CAP LS 302
@@ -1141,9 +1181,10 @@ fn translate(
         Command::TOPIC(channel, Some(topic)) => {
             vec![Event::Topic { channel, topic: strip_irc_formatting(&topic) }]
         }
-        Command::INVITE(invited, channel) => vec![Event::Notice {
-            from: "*".into(),
-            text: format!("{nick} invited {invited} to {channel}"),
+        Command::INVITE(invited, channel) => vec![Event::Invited {
+            by: nick,
+            target: invited,
+            channel,
             meta,
         }],
         Command::KICK(channel, target, reason) => {
@@ -1169,6 +1210,14 @@ fn translate(
             None => vec![Event::Notice { from: nick, text: strip_irc_formatting(&text), meta }],
         },
         Command::Response(code, args) => match code {
+            // RPL_KEYVALUE <me> <target> <key> <vis> [<value>]: the answer to
+            // our own METADATA SET, same shape as a live update.
+            Response::RPL_KEYVALUE if args.len() >= 4 => vec![Event::Metadata {
+                target: args[1].clone(),
+                key: args[2].clone(),
+                value: args.get(4).cloned(),
+            }],
+            Response::RPL_METADATAEND => vec![],
             Response::RPL_ISUPPORT => {
                 let token_count = args.len().saturating_sub(1);
                 let mut changed = false;
@@ -1221,6 +1270,19 @@ fn translate(
                 .map(|text| vec![Event::Notice { from: "*".into(), text, meta }])
                 .unwrap_or_default(),
         },
+        Command::METADATA(ref target, None, Some(ref params)) if !params.is_empty() => {
+            // `METADATA <target> <key> <vis>` (3 args: the key was cleared).
+            vec![Event::Metadata { target: target.clone(), key: params[0].clone(), value: None }]
+        }
+        Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("METADATA") && args.len() >= 3 => {
+            vec![Event::Metadata { target: args[0].clone(), key: args[1].clone(), value: args.get(3).cloned() }]
+        }
+        // RPL_METADATASUBOK; 771 UNSUBOK, 772 SUBS and 774 SYNCLATER (retried
+        // by the worker loop) are bookkeeping, not worth a status line.
+        Command::Raw(ref cmd, ref args) if cmd == "770" => {
+            vec![Event::MetadataSubOk(args.iter().skip(1).cloned().collect())]
+        }
+        Command::Raw(ref cmd, _) if matches!(cmd.as_str(), "771" | "772" | "774") => vec![],
         Command::Raw(ref cmd, ref args) => {
             if let Ok(n) = cmd.parse::<u16>() {
                 if let Some(text) = format_extended_numeric(n, args) {
@@ -1639,6 +1701,49 @@ mod tests {
     }
 
     use super::*;
+
+    fn translated(line: &str) -> Vec<Event> {
+        let msg: Message = line.parse().unwrap();
+        translate(msg, &HashMap::new(), &mut ISupport::default())
+    }
+
+    #[test]
+    fn metadata_wire_forms() {
+        // Value set (4 args: irc-proto leaves it Raw).
+        match translated(":soju METADATA bob soju.im/blocked * 1").as_slice() {
+            [Event::Metadata { target, key, value }] => {
+                assert_eq!((target.as_str(), key.as_str(), value.as_deref()), ("bob", "soju.im/blocked", Some("1")));
+            }
+            other => panic!("unexpected: {}", other.len()),
+        }
+        // Cleared (3 args: irc-proto's METADATA variant).
+        match translated(":srv METADATA alice pronouns *").as_slice() {
+            [Event::Metadata { value: None, key, .. }] => assert_eq!(key, "pronouns"),
+            other => panic!("unexpected: {}", other.len()),
+        }
+        // RPL_KEYVALUE answering our SET.
+        match translated(":soju 761 me #c soju.im/muted * 1").as_slice() {
+            [Event::Metadata { target, value, .. }] => {
+                assert_eq!(target, "#c");
+                assert_eq!(value.as_deref(), Some("1"));
+            }
+            other => panic!("unexpected: {}", other.len()),
+        }
+        assert!(matches!(
+            translated(":soju 770 me soju.im/blocked").as_slice(),
+            [Event::MetadataSubOk(k)] if k == &vec!["soju.im/blocked".to_string()]
+        ));
+        assert!(translated(":soju 772 me soju.im/blocked").is_empty());
+    }
+
+    #[test]
+    fn monitor_targets_are_split_under_the_line_limit() {
+        let nicks: Vec<String> = (0..100).map(|i| format!("nick{i:04}")).collect();
+        let chunks = monitor_chunks(&nicks);
+        assert!(chunks.len() > 1);
+        assert!(chunks.iter().all(|c| c.len() <= 400));
+        assert_eq!(chunks.join(",").split(',').count(), 100);
+    }
 
     /// Drive `scram_step` through the RFC 7677 exchange, base64 on the wire.
     fn scram_round(caps: &mut CapState, phase: &mut AuthPhase, server: &str) -> (AuthOutcome, Vec<String>) {

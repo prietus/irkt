@@ -122,7 +122,6 @@ pub enum Outgoing {
 pub enum MonitorCmd {
     Add(Vec<String>),
     Del(Vec<String>),
-    Clear,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,6 +173,17 @@ pub enum Event {
         count: u32,
         newest_ts: Option<String>,
     },
+    /// Registration finished (end of MOTD): MONITOR/METADATA can be sent.
+    Registered,
+    /// draft/metadata-2: `METADATA <target> <key> <vis> [<value>]`, or
+    /// `RPL_KEYVALUE` for our own SET. No value means the key was cleared.
+    Metadata { target: String, key: String, value: Option<String> },
+    /// `RPL_METADATASUBOK <me> <key>…`: the subscription (and, on soju, the
+    /// initial state report) for these keys is complete.
+    MetadataSubOk(Vec<String>),
+    /// `INVITE <target> <channel>` from `by`: an invitation for us, or (with
+    /// `invite-notify`) someone else being invited to a channel we're in.
+    Invited { by: String, target: String, channel: String, meta: MsgMeta },
     /// `FAIL CHATHISTORY …`: the request was refused. FAIL doesn't name the
     /// target, so every buffer with a request in flight is released.
     ChatHistoryFailed,

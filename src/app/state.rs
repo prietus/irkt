@@ -314,6 +314,13 @@ pub struct Network {
     pub members: std::collections::HashMap<String, Vec<MemberEntry>>,
     /// Buddies currently online (from MONITOR).
     pub online_buddies: std::collections::HashSet<String>,
+    /// MONITORed nicks (lowercased) reported away via extended-monitor or
+    /// away-notify.
+    pub away_nicks: std::collections::HashSet<String>,
+    /// Nicks (lowercased) this connection has asked the server to MONITOR.
+    pub monitored: std::collections::HashSet<String>,
+    /// Past end-of-MOTD on the current connection.
+    pub registered: bool,
     /// Replies we've sent that are awaiting their echo, so we can re-apply the
     /// `reply_to` locally if the server doesn't echo the `+draft/reply` tag
     /// back (some networks strip client-only tags). (target_lc, text, parent_msgid).
@@ -322,6 +329,19 @@ pub struct Network {
     /// only that tag (or an empty page) ends history; a short page doesn't,
     /// since servers like Ergo return short pages mid-history.
     pub history_end_tag_seen: bool,
+    /// Channel of the latest invitation for us: a bare `/join` accepts it.
+    pub last_invite: Option<String>,
+    /// `/mute`d conversations (lowercased): no desktop notifications.
+    pub muted: std::collections::HashSet<String>,
+    /// `/pin`ned conversations (lowercased): listed first in the sidebar.
+    pub pinned: std::collections::HashSet<String>,
+    /// Per soju key, the targets set there at the last sync (persisted): the
+    /// common ancestor of the three-way merge on connect.
+    pub meta_synced: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// draft/metadata-2 sync state for the current connection.
+    pub meta: super::metadata::MetaSync,
+    /// Other users' profile metadata, by lowercased nick: key → value.
+    pub user_meta: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 }
 
 impl Network {
@@ -346,8 +366,17 @@ impl Network {
             buffers: vec![status],
             members: std::collections::HashMap::new(),
             online_buddies: std::collections::HashSet::new(),
+            away_nicks: std::collections::HashSet::new(),
+            monitored: std::collections::HashSet::new(),
+            registered: false,
             pending_replies: Vec::new(),
             history_end_tag_seen: false,
+            last_invite: None,
+            muted: Default::default(),
+            pinned: Default::default(),
+            meta_synced: Default::default(),
+            meta: Default::default(),
+            user_meta: Default::default(),
         }
     }
 
@@ -489,9 +518,13 @@ impl App {
         let hide_join_part = config.hide_join_part;
         let notifications = config.notifications;
         let upload_cfg = config.upload.clone();
-        let highlight_keywords = config.highlight_keywords.clone();
-        let ignored_nicks = config.ignored_nicks.clone();
-        let dimmed_nicks = config.dimmed_nicks.clone();
+        // The config template ships `[""]` placeholders: drop blank entries.
+        let nonblank = |v: &[String]| -> Vec<String> {
+            v.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string).collect()
+        };
+        let highlight_keywords = nonblank(&config.highlight_keywords);
+        let ignored_nicks = nonblank(&config.ignored_nicks);
+        let dimmed_nicks = nonblank(&config.dimmed_nicks);
         let theme = Theme::by_name(config.theme.as_deref().unwrap_or("dark"));
         App {
             networks: Vec::new(),

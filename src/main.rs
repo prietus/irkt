@@ -152,7 +152,7 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         }
     }
     // Likewise the live /ignore and /dim nick lists merge with config.toml.
-    for n in &saved.ignored_nicks {
+    for n in saved.ignored_nicks.iter().filter(|n| !n.trim().is_empty()) {
         if !app.ignored_nicks.iter().any(|x| x.eq_ignore_ascii_case(n)) {
             app.ignored_nicks.push(n.clone());
         }
@@ -188,7 +188,24 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
                 }
             }
         });
-        app.networks.push(Network::new(id, net_cfg, out));
+        let mut net = Network::new(id, net_cfg, out);
+        // Muted/pinned conversations and the last soju metadata sync (sidecar).
+        use app::metadata::{MUTED, PINNED, SYNCED_KEYS};
+        let flags = |k: &str| -> std::collections::HashSet<String> {
+            saved
+                .target_flags
+                .get(&config::state::flag_key(&net.cfg.name, k))
+                .map(|v| v.iter().map(|t| t.to_lowercase()).collect())
+                .unwrap_or_default()
+        };
+        net.muted = flags(MUTED);
+        net.pinned = flags(PINNED);
+        for key in SYNCED_KEYS {
+            if let Some(v) = saved.metadata_synced.get(&config::state::flag_key(&net.cfg.name, key)) {
+                net.meta_synced.insert(key.to_string(), v.iter().cloned().collect());
+            }
+        }
+        app.networks.push(net);
     }
 
     if app.networks.is_empty() {
@@ -404,6 +421,7 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
         // history, and (after the draw decided we're at the top) older pages.
         app.maybe_load_active_history();
         app.request_active_members();
+        app.sync_monitors();
         app.request_older_history();
     }
 

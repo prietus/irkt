@@ -256,9 +256,26 @@ pub mod state {
         /// config.toml's `dimmed_nicks`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub dimmed_nicks: Vec<String>,
+        /// `/mute`d conversations, keyed by `"<network> soju.im/muted"`, and
+        /// `/pin`ned ones under `"<network> soju.im/pinned"`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub target_flags: BTreeMap<String, Vec<String>>,
+        /// Per `"<network> <soju key>"`: the targets flagged on soju at the
+        /// last metadata sync (the three-way merge's common ancestor).
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub metadata_synced: BTreeMap<String, Vec<String>>,
+    }
+
+    /// Key for the per-network maps above.
+    pub fn flag_key(network: &str, key: &str) -> String {
+        format!("{network} {key}")
     }
 
     fn path() -> Option<PathBuf> {
+        // Tests must never read or rewrite the user's real sidecar.
+        if cfg!(test) {
+            return None;
+        }
         super::config_path().and_then(|p| p.parent().map(|d| d.join("state.toml")))
     }
 
@@ -310,6 +327,30 @@ pub mod state {
         let mut st = load();
         st.ignored_nicks = nicks.to_vec();
         store(&st)
+    }
+
+    /// Persist a network's muted/pinned set (`key` is the soju key).
+    pub fn save_target_flags(network: &str, key: &str, targets: &[String]) -> Result<(), String> {
+        let mut st = load();
+        set_or_remove(&mut st.target_flags, flag_key(network, key), targets);
+        store(&st)
+    }
+
+    /// Persist the targets flagged on soju at the last metadata sync.
+    pub fn save_metadata_synced(network: &str, key: &str, targets: &[String]) -> Result<(), String> {
+        let mut st = load();
+        set_or_remove(&mut st.metadata_synced, flag_key(network, key), targets);
+        store(&st)
+    }
+
+    fn set_or_remove(map: &mut BTreeMap<String, Vec<String>>, k: String, targets: &[String]) {
+        if targets.is_empty() {
+            map.remove(&k);
+        } else {
+            let mut v = targets.to_vec();
+            v.sort();
+            map.insert(k, v);
+        }
     }
 
     /// Persist the live `/dim` nick list without touching config.toml.

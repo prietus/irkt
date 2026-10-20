@@ -10,15 +10,18 @@ the [`irc`](https://crates.io/crates/irc) protocol crate, and `tokio`.
 
 - **Multi-network** — connect to several networks at once, one worker per network,
   each with its own identity, auto-join channels, and reconnect/backoff.
-- **SASL** — PLAIN and EXTERNAL (CertFP via a TLS client certificate),
-  `draft/sasl-ir` fast path.
+- **SASL** — SCRAM-SHA-256 (preferred when offered), PLAIN and EXTERNAL
+  (CertFP via a TLS client certificate), `draft/sasl-ir` fast path.
 - **Full IRCv3** — message-tags, server-time, account-tag, extended-join,
   account/away/setname/chghost-notify, multi-prefix, userhost-in-names,
   echo-message, labeled-response, cap-notify (live CAP NEW/DEL), STS,
   batch (netsplit/netjoin summaries), `draft/multiline`, `draft/typing`,
   `draft/read-marker`, `draft/message-redaction`, `draft/chathistory`,
-  MONITOR presence, reactions (`+draft/react`), and reply threading
-  (`+draft/reply`). ISUPPORT (PREFIX/CHANTYPES/CASEMAPPING/MONITOR/CLIENTTAGDENY).
+  MONITOR presence (buddies and open queries, `extended-monitor`),
+  invite-notify, no-implicit-names, standard-replies, `draft/metadata-2`
+  (profiles; on soju, `/ignore`, `/mute` and `/pin` sync with
+  `soju.im/blocked`/`muted`/`pinned`), reactions (`+draft/react`), and reply
+  threading (`+draft/reply`). ISUPPORT (PREFIX/CHANTYPES/CASEMAPPING/MONITOR/CLIENTTAGDENY).
 - **Inline images** — URLs in messages are fetched and classified by their
   `Content-Type` (not their file extension, so extension-less imgur/CDN links
   work). Images are drawn inline; the graphics protocol (Kitty, iTerm2, Sixel)
@@ -112,7 +115,11 @@ Add more `[[network]]` blocks to connect to multiple networks.
 ## Commands
 
 `/join /part /msg /query /me /nick /topic /whois /away /mode /kick /invite`
-`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /notify /theme /lang /highlight /ignore /dim /upload /react /reply /redact /quit`
+`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /notify /theme /lang /highlight /ignore /dim /mute /unmute /pin /unpin /upload /react /reply /redact /quit`
+
+`/mute [target]` silences a conversation's notifications and `/pin [target]`
+lists it first in the sidebar (both default to the current buffer). An
+invitation lands in the status buffer; a bare `/join` accepts the latest one.
 
 `/ignore [add|del|list|clear] <nick>…` hides a nick's messages entirely;
 `/dim [add|del|list|clear] <nick>…` is a softer version that still shows them

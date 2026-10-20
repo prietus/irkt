@@ -109,7 +109,12 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(if sel_net { t.accent } else { t.bright }).add_modifier(Modifier::BOLD),
             ),
         ]));
-        for (bi, buf) in net.buffers.iter().enumerate() {
+        // Status first, then pinned conversations, then the rest. Only the
+        // display order changes: `bi` stays the real index for clicks.
+        let mut order: Vec<usize> = (0..net.buffers.len()).collect();
+        order.sort_by_key(|&bi| (bi != 0, !net.is_pinned(&net.buffers[bi].name)));
+        for bi in order {
+            let buf = &net.buffers[bi];
             let active = sel_net && bi == app.active.buf;
             let mut spans = Vec::new();
             let marker = if active { "▌" } else { " " };
@@ -124,7 +129,25 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(t.dim)
             };
             let label = if bi == 0 { "status".to_string() } else { buf.name.clone() };
+            // MONITOR presence for private conversations: online, away, offline.
+            let lc = buf.name.to_lowercase();
+            if buf.kind == BufferKind::Query && net.monitored.contains(&lc) {
+                let (dot, color) = if !net.online_buddies.contains(&lc) {
+                    ('○', t.dim)
+                } else if net.away_nicks.contains(&lc) {
+                    ('●', t.warn)
+                } else {
+                    ('●', t.good)
+                };
+                spans.push(Span::styled(format!(" {dot}"), Style::default().fg(color)));
+            }
+            if bi != 0 && net.is_pinned(&buf.name) {
+                spans.push(Span::styled(" ^", Style::default().fg(t.accent)));
+            }
             spans.push(Span::styled(format!(" {label}"), name_style));
+            if bi != 0 && net.is_muted(&buf.name) {
+                spans.push(Span::styled(" ~", Style::default().fg(t.dim)));
+            }
             if buf.mentions > 0 {
                 spans.push(Span::styled(
                     format!(" ({})", buf.mentions),
@@ -146,7 +169,12 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
             });
             for b in &buddies {
                 let online = net.online_buddies.contains(&b.to_lowercase());
-                let (dot, color) = if online { ('●', t.good) } else { ('○', t.dim) };
+                let away = net.away_nicks.contains(&b.to_lowercase());
+                let (dot, color) = match (online, away) {
+                    (false, _) => ('○', t.dim),
+                    (true, true) => ('●', t.warn),
+                    (true, false) => ('●', t.good),
+                };
                 lines.push(RLine::from(vec![
                     Span::styled(format!("  {dot} "), Style::default().fg(color)),
                     Span::styled(b.clone(), Style::default().fg(if online { t.bright } else { t.dim })),

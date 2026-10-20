@@ -2,7 +2,7 @@
 //! [`Outgoing`] variants, or mutate UI state directly.
 
 use super::state::*;
-use crate::irc::{MonitorCmd, Outgoing};
+use crate::irc::Outgoing;
 
 /// Which per-nick list a `/ignore` or `/dim` command operates on.
 #[derive(Clone, Copy)]
@@ -58,10 +58,16 @@ impl App {
 
         match cmd_lc.as_str() {
             "join" | "j" => {
-                if rest.is_empty() {
-                    self.set_status("usage: /join #channel [key]");
-                    return;
-                }
+                // A bare /join accepts the latest invitation.
+                let invited = self.networks[ni].last_invite.take();
+                let rest = match (rest.is_empty(), &invited) {
+                    (true, Some(chan)) => chan.as_str(),
+                    (true, None) => {
+                        self.set_status("usage: /join #channel [key]");
+                        return;
+                    }
+                    (false, _) => rest,
+                };
                 let mut parts = rest.split_whitespace();
                 let chan = parts.next().unwrap().to_string();
                 let args: Vec<String> = std::iter::once(chan.clone())
@@ -229,9 +235,18 @@ impl App {
                     self.set_status("usage: /whois <nick>");
                     return;
                 }
-                let _ = self.networks[ni]
-                    .out
-                    .try_send(Outgoing::Whois(rest.split_whitespace().next().unwrap().to_string()));
+                let nick = rest.split_whitespace().next().unwrap().to_string();
+                // draft/metadata-2 profile, when the server shares one.
+                let net = &self.networks[ni];
+                let profile: Vec<String> = crate::app::metadata::PROFILE_KEYS
+                    .iter()
+                    .filter_map(|k| net.profile(&nick, k).map(|v| format!("{k}: {v}")))
+                    .collect();
+                if !profile.is_empty() {
+                    let text = format!("{nick} profile — {}", profile.join(" · "));
+                    self.networks[ni].status_mut().push(Line::system(text));
+                }
+                let _ = self.networks[ni].out.try_send(Outgoing::Whois(nick));
             }
             "whowas" => {
                 if rest.is_empty() {
@@ -504,7 +519,33 @@ impl App {
                     self.set_status(format!("desktop notifications {s}"));
                 }
             }
-            "ignore" => self.cmd_nick_list(NickList::Ignore, rest),
+            "ignore" => {
+                // Exact-nick ignores are mirrored to soju's block list.
+                let before = self.ignored_nicks.clone();
+                self.cmd_nick_list(NickList::Ignore, rest);
+                self.sync_ignore_edit(&before);
+            }
+            "mute" | "unmute" | "pin" | "unpin" => {
+                let key = if cmd_lc.ends_with("mute") { crate::app::metadata::MUTED } else { crate::app::metadata::PINNED };
+                let on = !cmd_lc.starts_with("un");
+                let target = match rest.split_whitespace().next() {
+                    Some(t) => t.to_string(),
+                    None if self.active.buf != 0 => self.networks[ni].buffers[self.active.buf].name.clone(),
+                    None => {
+                        self.set_status(format!("usage: /{cmd_lc} [#channel|nick] (default: this buffer)"));
+                        return;
+                    }
+                };
+                self.set_flag(ni, key, &target, on);
+                let what = match (key == crate::app::metadata::MUTED, on) {
+                    (true, true) => "muted (no notifications)",
+                    (true, false) => "unmuted",
+                    (false, true) => "pinned",
+                    (false, false) => "unpinned",
+                };
+                let synced = if self.networks[ni].meta.active.contains(key) { ", synced with soju" } else { "" };
+                self.set_status(format!("{target}: {what}{synced}"));
+            }
             "dim" => self.cmd_nick_list(NickList::Dim, rest),
             "imgdbg" => {
                 use crate::images::ImageState;
@@ -812,7 +853,7 @@ impl App {
                         self.networks[ni].cfg.buddies.push(n.clone());
                     }
                 }
-                let _ = self.networks[ni].out.try_send(Outgoing::Monitor(MonitorCmd::Add(nicks)));
+                // sync_monitor sends the MONITOR + for the new buddies.
                 self.persist_buddies(ni);
             }
             "del" | "-" | "rm" => {
@@ -821,7 +862,6 @@ impl App {
                     .cfg
                     .buddies
                     .retain(|b| !nicks.iter().any(|n| n.eq_ignore_ascii_case(b)));
-                let _ = self.networks[ni].out.try_send(Outgoing::Monitor(MonitorCmd::Del(nicks)));
                 self.persist_buddies(ni);
             }
             "list" | "" => {
@@ -833,7 +873,6 @@ impl App {
             }
             "clear" => {
                 self.networks[ni].cfg.buddies.clear();
-                let _ = self.networks[ni].out.try_send(Outgoing::Monitor(MonitorCmd::Clear));
                 self.persist_buddies(ni);
             }
             _ => self.set_status("usage: /monitor add|del|list|clear"),

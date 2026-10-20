@@ -85,6 +85,10 @@ impl App {
             return None;
         }
         let buf = &self.networks[net_idx].buffers[buf_idx];
+        // `/mute` silences a conversation's notifications (unread still counts).
+        if buf_idx != 0 && self.networks[net_idx].is_muted(&buf.name) {
+            return None;
+        }
         let is_pm = matches!(buf.kind, BufferKind::Query)
             && matches!(line.kind, LineKind::Message | LineKind::Action);
         if !line.highlight && !is_pm {
@@ -105,14 +109,19 @@ impl App {
                 self.networks[ni]
                     .status_mut()
                     .push(Line::system("connected"));
-                // Register buddies for presence.
-                let buddies = self.networks[ni].cfg.buddies.clone();
-                if !buddies.is_empty() {
-                    let _ = self.networks[ni]
-                        .out
-                        .try_send(Outgoing::Monitor(crate::irc::MonitorCmd::Add(buddies)));
-                }
             }
+            Event::Registered => {
+                // The server's MONITOR list is per connection: start afresh.
+                let net = &mut self.networks[ni];
+                net.registered = true;
+                net.monitored.clear();
+                self.sync_monitor(ni);
+                self.start_metadata(ni);
+            }
+            Event::Metadata { target, key, value } => {
+                self.on_metadata(ni, &target, &key, value.as_deref());
+            }
+            Event::MetadataSubOk(keys) => self.on_metadata_sub_ok(ni, &keys),
             Event::CapsAcked(caps) => {
                 self.networks[ni].caps = caps;
             }
@@ -124,6 +133,13 @@ impl App {
             }
             Event::Disconnected => {
                 self.networks[ni].conn = ConnState::Disconnected;
+                // Presence is unknown until the new connection's MONITOR replies.
+                let net = &mut self.networks[ni];
+                net.registered = false;
+                net.monitored.clear();
+                net.online_buddies.clear();
+                net.away_nicks.clear();
+                net.meta = Default::default();
                 // Membership is unknown while offline; clear it so the fresh NAMES
                 // after reconnect rebuilds it instead of stacking on a stale roster.
                 self.networks[ni].members.clear();
@@ -176,6 +192,33 @@ impl App {
                 };
                 // Server notices land in the status buffer.
                 self.push_to(ni, 0, line);
+            }
+            Event::Invited { by, target, channel, meta } => {
+                // Replayed history isn't a live invitation, and an ignored
+                // user's invites are as unwelcome as their messages.
+                if is_playback(&meta) || self.ignored(&by) {
+                    return;
+                }
+                let net = &mut self.networks[ni];
+                if target.eq_ignore_ascii_case(&net.nick) {
+                    net.last_invite = Some(channel.clone());
+                    let line = Line {
+                        time: meta.server_time_hhmm.unwrap_or_default(),
+                        kind: LineKind::Notice,
+                        from: by.clone(),
+                        text: format!("{by} invited you to {channel} — /join to accept"),
+                        msgid: None,
+                        // Addressed to us: counts as a mention and notifies.
+                        highlight: true,
+                        reply_to: None,
+                        ts_iso: meta.server_time_iso,
+                    };
+                    self.push_to(ni, 0, line);
+                } else {
+                    // invite-notify: someone else was invited to a channel we're in.
+                    let bi = net.find_buffer(&channel).unwrap_or(0);
+                    net.buffers[bi].push(Line::system(format!("{by} invited {target} to {channel}")));
+                }
             }
             Event::CtcpReply { from, query, args } => {
                 self.networks[ni]
@@ -314,6 +357,10 @@ impl App {
                 if is_self {
                     net.nick = new.clone();
                 }
+                // Profile metadata follows the person to their new nick.
+                if let Some(m) = net.user_meta.remove(&old.to_lowercase()) {
+                    net.user_meta.insert(new.to_lowercase(), m);
+                }
                 for m in net.members.values_mut() {
                     for e in m.iter_mut() {
                         if e.nick.eq_ignore_ascii_case(&old) {
@@ -430,6 +477,11 @@ impl App {
                 // the member's away flag (a non-empty message means gone) across
                 // every roster this nick appears in, so the panel dims them live.
                 let away = message.is_some();
+                if away {
+                    self.networks[ni].away_nicks.insert(nick.to_lowercase());
+                } else {
+                    self.networks[ni].away_nicks.remove(&nick.to_lowercase());
+                }
                 for roster in self.networks[ni].members.values_mut() {
                     if let Some(m) = roster.iter_mut().find(|e| e.nick.eq_ignore_ascii_case(&nick)) {
                         m.is_away = away;
@@ -507,6 +559,7 @@ impl App {
                         net.online_buddies.insert(n.to_lowercase());
                     } else {
                         net.online_buddies.remove(&n.to_lowercase());
+                        net.away_nicks.remove(&n.to_lowercase());
                     }
                 }
             }
@@ -738,6 +791,59 @@ impl App {
             args: vec![channel.clone()],
         });
         self.request_who(ni, &channel);
+    }
+
+    /// Nicks this network should MONITOR: the configured buddies, then every
+    /// open private conversation (their presence shows in the sidebar), capped
+    /// at the server's MONITOR limit.
+    fn monitor_wanted(&self, ni: usize) -> Vec<String> {
+        let net = &self.networks[ni];
+        let mut seen = std::collections::HashSet::new();
+        let queries = net.buffers.iter().filter(|b| b.kind == BufferKind::Query).map(|b| &b.name);
+        let limit = net.isupport.monitor_limit.unwrap_or(0) as usize;
+        net.cfg
+            .buddies
+            .iter()
+            .chain(queries)
+            .filter(|n| seen.insert(n.to_lowercase()))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Bring the server's MONITOR list in line with [`Self::monitor_wanted`],
+    /// sending only the difference. Cheap when nothing changed, so it runs
+    /// after every batch of events: opening or closing a query, a buddy edit,
+    /// or a reconnect are all covered by the same diff.
+    pub fn sync_monitor(&mut self, ni: usize) {
+        let net = &self.networks[ni];
+        if !net.registered || net.isupport.monitor_limit.is_none() {
+            return;
+        }
+        let wanted = self.monitor_wanted(ni);
+        let wanted_lc: std::collections::HashSet<String> = wanted.iter().map(|n| n.to_lowercase()).collect();
+        let net = &mut self.networks[ni];
+        let add: Vec<String> = wanted.into_iter().filter(|n| !net.monitored.contains(&n.to_lowercase())).collect();
+        let del: Vec<String> = net.monitored.iter().filter(|n| !wanted_lc.contains(*n)).cloned().collect();
+        if !del.is_empty() {
+            for n in &del {
+                net.monitored.remove(n);
+                net.online_buddies.remove(n);
+                net.away_nicks.remove(n);
+            }
+            let _ = net.out.try_send(Outgoing::Monitor(crate::irc::MonitorCmd::Del(del)));
+        }
+        if !add.is_empty() {
+            net.monitored.extend(add.iter().map(|n| n.to_lowercase()));
+            let _ = net.out.try_send(Outgoing::Monitor(crate::irc::MonitorCmd::Add(add)));
+        }
+    }
+
+    /// [`Self::sync_monitor`] for every network.
+    pub fn sync_monitors(&mut self) {
+        for ni in 0..self.networks.len() {
+            self.sync_monitor(ni);
+        }
     }
 
     /// Ensure the active buffer has requested its initial backlog. Called from
@@ -2034,6 +2140,187 @@ mod tests {
         app.select_buffer(0, bi);
         app.request_active_members();
         assert!(raw_cmds(&mut out_rx).is_empty(), "the server already sent NAMES");
+    }
+
+    fn invite(app: &mut App, by: &str, target: &str, chan: &str, m: MsgMeta) {
+        app.apply_event(0, Event::Invited { by: by.into(), target: target.into(), channel: chan.into(), meta: m });
+    }
+
+    #[test]
+    fn invite_for_us_lands_in_status_as_a_mention_and_arms_join() {
+        let (mut app, _rx) = app_with_outbox();
+        // Looking at another buffer, so status counts the mention.
+        let c = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        app.select_buffer(0, c);
+        invite(&mut app, "alice", "ME", "#secret", meta());
+        let status = &app.networks[0].buffers[0];
+        assert!(status.lines.last().unwrap().text.contains("invited you to #secret"));
+        assert_eq!(status.mentions, 1);
+        assert_eq!(app.networks[0].last_invite.as_deref(), Some("#secret"));
+    }
+
+    #[test]
+    fn invite_notify_goes_to_the_channel_and_ignored_or_replayed_invites_are_dropped() {
+        let (mut app, _rx) = app_with_outbox();
+        let bi = app.networks[0].ensure_buffer("#c", BufferKind::Channel);
+        invite(&mut app, "alice", "bob", "#c", meta());
+        assert!(app.networks[0].buffers[bi].lines.last().unwrap().text.contains("invited bob"));
+        app.ignored_nicks.push("troll".into());
+        invite(&mut app, "troll", "me", "#spam", meta());
+        let replay = MsgMeta { batch_kind: Some("chathistory".into()), ..meta() };
+        invite(&mut app, "alice", "me", "#old", replay);
+        assert!(app.networks[0].last_invite.is_none());
+        assert!(app.networks[0].buffers[0].lines.is_empty());
+    }
+
+    fn monitor_cmds(out_rx: &mut mpsc::Receiver<Outgoing>) -> Vec<(char, Vec<String>)> {
+        std::iter::from_fn(|| out_rx.try_recv().ok())
+            .filter_map(|o| match o {
+                Outgoing::Monitor(crate::irc::MonitorCmd::Add(n)) => Some(('+', n)),
+                Outgoing::Monitor(crate::irc::MonitorCmd::Del(n)) => Some(('-', n)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn monitor_follows_buddies_and_open_queries() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].isupport.monitor_limit = Some(100);
+        app.networks[0].cfg.buddies = vec!["Alice".into()];
+        app.networks[0].ensure_buffer("bob", BufferKind::Query);
+        // Nothing before registration.
+        app.sync_monitors();
+        assert!(monitor_cmds(&mut out_rx).is_empty());
+        app.apply_event(0, Event::Registered);
+        assert_eq!(monitor_cmds(&mut out_rx), vec![('+', vec!["Alice".into(), "bob".into()])]);
+        // Idempotent.
+        app.sync_monitors();
+        assert!(monitor_cmds(&mut out_rx).is_empty());
+        // Closing the query unmonitors it; a new one is added.
+        let bob = app.networks[0].find_buffer("bob").unwrap();
+        app.networks[0].buffers.remove(bob);
+        app.networks[0].ensure_buffer("carol", BufferKind::Query);
+        app.sync_monitors();
+        assert_eq!(
+            monitor_cmds(&mut out_rx),
+            vec![('-', vec!["bob".into()]), ('+', vec!["carol".into()])]
+        );
+    }
+
+    #[test]
+    fn no_monitor_without_server_support() {
+        let (mut app, mut out_rx) = app_with_outbox();
+        app.networks[0].cfg.buddies = vec!["alice".into()];
+        app.apply_event(0, Event::Registered);
+        assert!(monitor_cmds(&mut out_rx).is_empty());
+    }
+
+    fn soju_app() -> (App, mpsc::Receiver<Outgoing>) {
+        let (mut app, rx) = app_with_outbox();
+        app.networks[0].caps = vec!["draft/metadata-2".into(), "soju.im/no-implicit-names".into()];
+        app.networks[0].cfg.sasl_username = Some("me/libera".into());
+        (app, rx)
+    }
+
+    fn md(app: &mut App, target: &str, key: &str, value: Option<&str>) {
+        app.apply_event(0, Event::Metadata { target: target.into(), key: key.into(), value: value.map(Into::into) });
+    }
+
+    #[test]
+    fn soju_metadata_subscribes_to_its_flags_on_a_bound_connection() {
+        let (mut app, mut rx) = soju_app();
+        app.apply_event(0, Event::Registered);
+        assert!(raw_cmds(&mut rx).contains(&"METADATA * SUB soju.im/blocked soju.im/muted soju.im/pinned".to_string()));
+        // Unbound (no user/network login): nothing to sync, and soju rejects profile keys.
+        let (mut app, mut rx) = soju_app();
+        app.networks[0].cfg.sasl_username = None;
+        app.apply_event(0, Event::Registered);
+        assert!(!raw_cmds(&mut rx).iter().any(|c| c.starts_with("METADATA")));
+    }
+
+    #[test]
+    fn metadata_three_way_merge() {
+        use crate::app::metadata::BLOCKED;
+        let (mut app, mut rx) = soju_app();
+        // At the last sync soju had {old, kept, gone}. Since then, here:
+        // unblocked "old", blocked "mine". Elsewhere: unblocked "gone",
+        // blocked "theirs".
+        app.networks[0].meta_synced.insert(BLOCKED.into(), ["old", "kept", "gone"].iter().map(|s| s.to_string()).collect());
+        app.ignored_nicks = vec!["kept".into(), "mine".into(), "gone".into()];
+        app.apply_event(0, Event::Registered);
+        raw_cmds(&mut rx);
+        // soju's state: old (cleared here while away), kept, theirs (set elsewhere).
+        // "gone" is missing on soju: cleared elsewhere.
+        for n in ["old", "kept", "theirs"] {
+            md(&mut app, n, BLOCKED, Some("1"));
+        }
+        app.apply_event(0, Event::MetadataSubOk(vec![BLOCKED.into()]));
+        let mut sent = raw_cmds(&mut rx);
+        sent.sort();
+        assert_eq!(sent, vec!["METADATA mine SET soju.im/blocked 1", "METADATA old SET soju.im/blocked 0"]);
+        let mut ignored = app.ignored_nicks.clone();
+        ignored.sort();
+        assert_eq!(ignored, vec!["kept", "mine", "theirs"]);
+        // Live from now on: another client unblocks "kept".
+        md(&mut app, "kept", BLOCKED, Some("0"));
+        assert!(!app.ignored_nicks.iter().any(|n| n == "kept"));
+    }
+
+    #[test]
+    fn blank_ignore_entries_never_reach_the_wire() {
+        use crate::app::metadata::BLOCKED;
+        let (mut app, mut rx) = soju_app();
+        app.ignored_nicks = vec!["".into(), "real".into()];
+        app.networks[0].meta_synced.insert(BLOCKED.into(), [String::new()].into_iter().collect());
+        app.apply_event(0, Event::Registered);
+        raw_cmds(&mut rx);
+        app.apply_event(0, Event::MetadataSubOk(vec![BLOCKED.into()]));
+        assert_eq!(raw_cmds(&mut rx), vec!["METADATA real SET soju.im/blocked 1"]);
+        assert!(!app.networks[0].meta_synced[BLOCKED].contains(""));
+    }
+
+    #[test]
+    fn mute_and_pin_sync_once_live() {
+        use crate::app::metadata::{MUTED, PINNED};
+        let (mut app, mut rx) = soju_app();
+        app.apply_event(0, Event::Registered);
+        // Before the merge: local only.
+        app.set_flag(0, MUTED, "#noisy", true);
+        assert!(app.networks[0].is_muted("#NOISY"));
+        raw_cmds(&mut rx);
+        app.apply_event(0, Event::MetadataSubOk(vec![MUTED.into(), PINNED.into()]));
+        // The merge pushes the offline mute.
+        assert_eq!(raw_cmds(&mut rx), vec!["METADATA #noisy SET soju.im/muted 1"]);
+        app.set_flag(0, PINNED, "#fav", true);
+        assert_eq!(raw_cmds(&mut rx), vec!["METADATA #fav SET soju.im/pinned 1"]);
+        assert!(app.networks[0].is_pinned("#fav"));
+    }
+
+    #[test]
+    fn muted_conversations_do_not_notify() {
+        let (mut app, _rx) = app_with_outbox();
+        app.notifications = true;
+        let q = app.networks[0].ensure_buffer("bob", BufferKind::Query);
+        app.networks[0].muted.insert("bob".into());
+        let line = Line { kind: LineKind::Message, from: "bob".into(), ..Line::system("hi") };
+        assert!(app.notification_for(0, q, &line, false).is_none());
+        app.networks[0].muted.clear();
+        assert!(app.notification_for(0, q, &line, false).is_some());
+    }
+
+    #[test]
+    fn profile_metadata_is_kept_per_nick_and_follows_renames() {
+        let (mut app, _rx) = app_with_outbox();
+        md(&mut app, "Alice", "display-name", Some("Alice A."));
+        md(&mut app, "alice", "pronouns", Some("she/her"));
+        md(&mut app, "#chan", "display-name", Some("nope"));
+        assert_eq!(app.networks[0].profile("ALICE", "display-name"), Some("Alice A."));
+        assert!(app.networks[0].profile("#chan", "display-name").is_none());
+        app.apply_event(0, Event::NickChanged { old: "alice".into(), new: "alice2".into(), meta: meta() });
+        assert_eq!(app.networks[0].profile("alice2", "pronouns"), Some("she/her"));
+        md(&mut app, "alice2", "pronouns", None);
+        assert!(app.networks[0].profile("alice2", "pronouns").is_none());
     }
 
     #[test]
