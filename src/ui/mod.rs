@@ -966,7 +966,7 @@ fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
     let avatar_of = |nick: &str| -> Option<String> {
         net.profile(nick, "avatar")
             .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
-            .map(str::to_string)
+            .map(avatar_url)
     };
     let wanted: Vec<String> = if show_avatars {
         sorted.iter().filter_map(|m| avatar_of(&m.nick)).collect()
@@ -1039,6 +1039,13 @@ fn draw_members(f: &mut Frame, area: Rect, app: &mut App) {
         let rect = Rect { x: inner.x + 1, y, width: 2.min(inner.width.saturating_sub(1)), height: 1 };
         draw_image(f, rect, &url, app);
     }
+}
+
+/// An avatar URL ready to fetch: the IRCv3 registry lets it carry a `{size}`
+/// placeholder for the wanted pixel size. Ours is a 2x1-cell square (about
+/// 28x30 px on a 2x display); ask for a little more so it stays crisp.
+fn avatar_url(raw: &str) -> String {
+    raw.replace("{size}", "64")
 }
 
 /// ` display name · pronouns`, cut to `width` columns, or `None` when the
@@ -1208,7 +1215,7 @@ mod render_tests {
             name: "libera".into(), nickname: "me".into(), username: None, realname: None,
             server: "s".into(), port: 6697, use_tls: true, nick_password: None,
             sasl_username: None, sasl_password: None, client_cert_path: None, client_cert_pass: None,
-            channels: vec![], buddies: vec![], autoconnect: true,
+            channels: vec![], buddies: vec![], autoconnect: true, profile: Default::default(),
         }
     }
 
@@ -1584,6 +1591,12 @@ mod render_tests {
         };
         let yb = row_of("bob").unwrap();
         assert_eq!(col(y, "alice"), col(yb, "bob"));
+    }
+
+    #[test]
+    fn avatar_size_placeholder_is_filled() {
+        assert_eq!(avatar_url("https://x.example/a/{size}.png"), "https://x.example/a/64.png");
+        assert_eq!(avatar_url("https://x.example/a.png"), "https://x.example/a.png");
     }
 
     #[test]

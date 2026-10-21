@@ -19,6 +19,9 @@ pub const MUTED: &str = "soju.im/muted";
 pub const PINNED: &str = "soju.im/pinned";
 pub const SYNCED_KEYS: [&str; 3] = [BLOCKED, MUTED, PINNED];
 pub const PROFILE_KEYS: [&str; 3] = ["avatar", "display-name", "pronouns"];
+/// Keys `/profile set` accepts for our own profile (IRCv3 registry, user
+/// metadata).
+pub const OWN_PROFILE_KEYS: [&str; 6] = ["display-name", "pronouns", "avatar", "color", "homepage", "status"];
 
 /// A target that can go on the wire as one METADATA parameter. A blank one
 /// (e.g. the config template's `ignored_nicks = [""]`) would shift `SET` into
@@ -69,6 +72,15 @@ impl Network {
         self.user_meta.get(&nick.to_lowercase())?.get(key).map(String::as_str)
     }
 
+    /// `METADATA * SET <key> [<value>]` for our own profile (no value clears).
+    fn send_own_profile(&self, key: &str, value: Option<&str>) {
+        let mut args = vec!["*".to_string(), "SET".to_string(), key.to_string()];
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            args.push(v.to_string());
+        }
+        let _ = self.out.try_send(Outgoing::Raw { cmd: "METADATA".into(), args });
+    }
+
     fn send_flag(&self, key: &str, target: &str, on: bool) {
         if !valid_target(target) {
             return;
@@ -97,12 +109,80 @@ impl App {
         if !net.is_soju() {
             keys.extend(PROFILE_KEYS.iter().map(|k| k.to_string()));
         }
-        if keys.is_empty() {
-            return;
+        if !keys.is_empty() {
+            let mut args = vec!["*".to_string(), "SUB".to_string()];
+            args.extend(keys);
+            let _ = net.out.try_send(Outgoing::Raw { cmd: "METADATA".into(), args });
         }
-        let mut args = vec!["*".to_string(), "SUB".to_string()];
-        args.extend(keys);
-        let _ = net.out.try_send(Outgoing::Raw { cmd: "METADATA".into(), args });
+        // Publish our own profile every time: servers may not keep it across
+        // connections (the spec leaves that open). soju rejects these keys:
+        // say so, since a profile under the wrong [[network]] looks like this.
+        if net.is_soju() {
+            if !net.cfg.profile.is_empty() {
+                net.status_mut().push(Line::system(
+                    "profile not published: this connection goes through soju, which doesn't carry profiles",
+                ));
+            }
+        } else {
+            let profile: Vec<(String, String)> = net.cfg.profile.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            for (key, value) in profile {
+                net.send_own_profile(&key, Some(&value));
+            }
+        }
+    }
+
+    /// `/profile`: show, set or clear our own profile on this network. Set
+    /// values persist (sidecar) and are re-published on every connect.
+    pub fn cmd_profile(&mut self, ni: usize, rest: &str) {
+        let mut parts = rest.splitn(3, char::is_whitespace);
+        let sub = parts.next().unwrap_or("").to_lowercase();
+        let key = parts.next().unwrap_or("").to_lowercase();
+        let value = parts.next().unwrap_or("").trim().to_string();
+        let net = &self.networks[ni];
+        match sub.as_str() {
+            "" | "show" => {
+                let shown: Vec<String> = net.cfg.profile.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+                let text = if shown.is_empty() {
+                    "no profile set (/profile set <key> <value>)".to_string()
+                } else {
+                    format!("your profile — {}", shown.join(" · "))
+                };
+                self.networks[ni].status_mut().push(Line::system(text));
+                self.active = ActiveBuffer { net: ni, buf: 0 };
+            }
+            "set" | "clear" | "unset" => {
+                if !OWN_PROFILE_KEYS.contains(&key.as_str()) {
+                    self.set_status(format!("usage: /profile set|clear <{}> [value]", OWN_PROFILE_KEYS.join("|")));
+                    return;
+                }
+                let value = if sub == "set" { value } else { String::new() };
+                if sub == "set" && value.is_empty() {
+                    self.set_status(format!("usage: /profile set {key} <value>"));
+                    return;
+                }
+                let net = &mut self.networks[ni];
+                if value.is_empty() {
+                    net.cfg.profile.remove(&key);
+                } else {
+                    net.cfg.profile.insert(key.clone(), value.clone());
+                }
+                let _ = crate::config::state::save_profile_key(&net.cfg.name, &key, &value);
+                let live = net.registered && net.has_cap("draft/metadata-2") && !net.is_soju();
+                if live {
+                    net.send_own_profile(&key, (!value.is_empty()).then_some(value.as_str()));
+                }
+                let note = if live {
+                    "published"
+                } else if net.is_soju() {
+                    "saved; soju doesn't carry profiles, so it's sent on servers that do"
+                } else {
+                    "saved; sent when connected to a server with draft/metadata-2"
+                };
+                let what = if value.is_empty() { format!("{key} cleared") } else { format!("{key} = {value}") };
+                self.set_status(format!("profile: {what} ({note})"));
+            }
+            _ => self.set_status("usage: /profile [show] | set <key> <value> | clear <key>"),
+        }
     }
 
     /// `METADATA <target> <key> <vis> [<value>]` (or `RPL_KEYVALUE`): during

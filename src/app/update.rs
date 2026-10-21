@@ -1342,7 +1342,7 @@ mod tests {
             client_cert_pass: None,
             channels: vec![],
             buddies: vec![],
-            autoconnect: true,
+            autoconnect: true, profile: Default::default(),
         };
         let (out, _r2) = mpsc::channel(8);
         // Leak the receivers so senders stay open for the test's lifetime.
@@ -1962,7 +1962,7 @@ mod tests {
             name: "t".into(), nickname: "me".into(), username: None, realname: None,
             server: "s".into(), port: 6697, use_tls: true, nick_password: None,
             sasl_username: None, sasl_password: None, client_cert_path: None,
-            client_cert_pass: None, channels: vec![], buddies: vec![], autoconnect: true,
+            client_cert_pass: None, channels: vec![], buddies: vec![], autoconnect: true, profile: Default::default(),
         };
         let (out, mut out_rx) = mpsc::channel(8);
         std::mem::forget(_r);
@@ -2107,7 +2107,7 @@ mod tests {
             name: "t".into(), nickname: "me".into(), username: None, realname: None,
             server: "s".into(), port: 6697, use_tls: true, nick_password: None,
             sasl_username: None, sasl_password: None, client_cert_path: None,
-            client_cert_pass: None, channels: vec![], buddies: vec![], autoconnect: true,
+            client_cert_pass: None, channels: vec![], buddies: vec![], autoconnect: true, profile: Default::default(),
         };
         let (out, out_rx) = mpsc::channel(8);
         std::mem::forget(_r);
@@ -2418,6 +2418,39 @@ mod tests {
         assert!(app.notification_for(0, q, &line, false).is_none());
         app.networks[0].muted.clear();
         assert!(app.notification_for(0, q, &line, false).is_some());
+    }
+
+    #[test]
+    fn own_profile_is_published_on_connect_but_not_to_soju() {
+        let (mut app, mut rx) = app_with_outbox();
+        app.networks[0].caps = vec!["draft/metadata-2".into()];
+        app.networks[0].cfg.profile.insert("pronouns".into(), "he/him".into());
+        app.networks[0].cfg.profile.insert("display-name".into(), "Carlos A.".into());
+        app.apply_event(0, Event::Registered);
+        let sent = raw_cmds(&mut rx);
+        assert!(sent.contains(&"METADATA * SET pronouns he/him".to_string()));
+        assert!(sent.contains(&"METADATA * SET display-name Carlos A.".to_string()));
+        // soju rejects profile keys: nothing goes out.
+        let (mut app, mut rx) = soju_app();
+        app.networks[0].cfg.profile.insert("pronouns".into(), "he/him".into());
+        app.apply_event(0, Event::Registered);
+        assert!(!raw_cmds(&mut rx).iter().any(|c| c.contains("pronouns")));
+    }
+
+    #[test]
+    fn profile_command_sets_and_clears_live() {
+        let (mut app, mut rx) = app_with_outbox();
+        app.networks[0].caps = vec!["draft/metadata-2".into()];
+        app.apply_event(0, Event::Registered);
+        raw_cmds(&mut rx);
+        app.cmd_profile(0, "set pronouns they/them");
+        assert_eq!(raw_cmds(&mut rx), vec!["METADATA * SET pronouns they/them"]);
+        assert_eq!(app.networks[0].cfg.profile.get("pronouns").map(String::as_str), Some("they/them"));
+        app.cmd_profile(0, "clear pronouns");
+        assert_eq!(raw_cmds(&mut rx), vec!["METADATA * SET pronouns"]);
+        assert!(!app.networks[0].cfg.profile.contains_key("pronouns"));
+        app.cmd_profile(0, "set favourite-food paella");
+        assert!(raw_cmds(&mut rx).is_empty(), "only registry keys");
     }
 
     #[test]

@@ -198,7 +198,7 @@ mod tests {
             name: "t".into(), nickname: "me".into(), username: None, realname: None,
             server: "s".into(), port: 6697, use_tls: true, nick_password: None,
             sasl_username: None, sasl_password: None, client_cert_path: None,
-            client_cert_pass: None, channels: vec![], buddies: vec![], autoconnect: true,
+            client_cert_pass: None, channels: vec![], buddies: vec![], autoconnect: true, profile: Default::default(),
         };
         let (out, r2) = mpsc::channel(8);
         std::mem::forget(r2);

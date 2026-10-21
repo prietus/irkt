@@ -130,6 +130,12 @@ pub struct NetworkConfig {
     pub buddies: Vec<String>,
     #[serde(default = "default_true")]
     pub autoconnect: bool,
+    /// Our own draft/metadata-2 profile, published on every connect where
+    /// the server supports it (not through soju). Keys are the IRCv3 registry
+    /// names: `display-name`, `pronouns`, `avatar`, `color`, `homepage`,
+    /// `status`. `/profile set` overrides these via the sidecar.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub profile: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +270,10 @@ pub mod state {
         /// last metadata sync (the three-way merge's common ancestor).
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         pub metadata_synced: BTreeMap<String, Vec<String>>,
+        /// network name -> profile key -> value, set with `/profile set`
+        /// (overrides `[network.profile]`). An empty value clears the key.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub profiles: BTreeMap<String, BTreeMap<String, String>>,
     }
 
     /// Key for the per-network maps above.
@@ -326,6 +336,13 @@ pub mod state {
     pub fn save_ignored_nicks(nicks: &[String]) -> Result<(), String> {
         let mut st = load();
         st.ignored_nicks = nicks.to_vec();
+        store(&st)
+    }
+
+    /// Persist a `/profile set` (empty `value` = cleared on purpose).
+    pub fn save_profile_key(network: &str, key: &str, value: &str) -> Result<(), String> {
+        let mut st = load();
+        st.profiles.entry(network.to_string()).or_default().insert(key.to_string(), value.to_string());
         store(&st)
     }
 
@@ -424,6 +441,13 @@ channels = ["#rust"]
 
 # Buddies tracked via MONITOR for online/offline presence.
 # buddies = ["alice", "bob"]
+
+# Your draft/metadata-2 profile, published on every connect to servers that
+# support it (e.g. Ergo; soju doesn't carry it). Or set it live: /profile set.
+# [network.profile]
+# display-name = "Your Name"
+# pronouns = "they/them"
+# avatar = "https://example.com/me.png"
 
 # Add more networks by copying the [[network]] block above.
 

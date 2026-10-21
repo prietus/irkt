@@ -115,7 +115,7 @@ Add more `[[network]]` blocks to connect to multiple networks.
 ## Commands
 
 `/join /part /msg /query /me /nick /topic /whois /away /mode /kick /invite`
-`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /notify /theme /lang /highlight /ignore /dim /mute /unmute /pin /unpin /upload /react /reply /redact /original /rawlog /quit`
+`/raw /names /monitor (/buddy) /setname /close /server /images /unfurl /joins /notify /theme /lang /highlight /ignore /dim /mute /unmute /pin /unpin /upload /react /reply /redact /original /rawlog /profile /quit`
 
 `/mute [target]` silences a conversation's notifications and `/pin [target]`
 lists it first in the sidebar (both default to the current buffer). An
@@ -126,6 +126,12 @@ A reply whose original predates the loaded scrollback shows a dim
 to fetch it (by msgid via `CHATHISTORY AROUND` where the server allows, else by
 paging back). `/rawlog` toggles a `*raw*` buffer with the network's wire
 traffic (passwords redacted).
+
+On servers with `draft/metadata-2` (e.g. Ergo, not soju), members' display
+names and pronouns show under their nick and their avatar before it. Publish
+your own with `/profile set display-name|pronouns|avatar|color|homepage|status
+<value>` (or `[network.profile]` in config.toml); it's re-sent on every connect,
+since servers needn't keep it.
 
 `/ignore [add|del|list|clear] <nick>…` hides a nick's messages entirely (kept,
 so `/ignore del` brings them back; on soju it also blocks them there);

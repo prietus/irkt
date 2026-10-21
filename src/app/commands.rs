@@ -524,6 +524,7 @@ impl App {
                 self.sync_ignore_edit(&before);
             }
             "original" | "orig" => self.fetch_original(),
+            "profile" => self.cmd_profile(ni, rest),
             "rawlog" => {
                 let on = match rest {
                     "on" => true,

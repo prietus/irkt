@@ -188,6 +188,13 @@ async fn run(cfg: config::AppConfig) -> io::Result<()> {
                 }
             }
         });
+        // `/profile set` choices (sidecar) override `[network.profile]`.
+        if let Some(saved_profile) = saved.profiles.get(&net_cfg.name) {
+            for (k, v) in saved_profile {
+                net_cfg.profile.insert(k.clone(), v.clone());
+            }
+        }
+        net_cfg.profile.retain(|_, v| !v.trim().is_empty());
         let mut net = Network::new(id, net_cfg, out);
         // Muted/pinned conversations and the last soju metadata sync (sidecar).
         use app::metadata::{MUTED, PINNED, SYNCED_KEYS};
