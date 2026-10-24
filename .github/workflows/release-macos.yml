@@ -31,6 +31,8 @@ jobs:
     runs-on: macos-14
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      # Lets the cask update below skip cleanly when the secret isn't set.
+      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -115,6 +117,30 @@ jobs:
           gh release create "$TAG" --title "$TAG" --generate-notes \
             || echo "release $TAG already exists"
           gh release upload "$TAG" "$ASSET" --clobber
+
+      # Point prietus/homebrew-tap's Casks/irkt.rb at this release, so
+      # `brew upgrade --cask irkt` picks it up. Needs HOMEBREW_TAP_TOKEN: a
+      # fine-grained token with Contents read/write on prietus/homebrew-tap.
+      - name: Update Homebrew cask
+        if: env.HAS_TAP_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          SHA=$(shasum -a 256 "$ASSET" | awk '{print $1}')
+          API=repos/prietus/homebrew-tap/contents/Casks/irkt.rb
+          BLOB=$(gh api "$API" --jq .sha)
+          gh api "$API" --jq .content | base64 --decode > irkt.rb
+          sed -i '' -E \
+            -e "s/^  version \".*\"/  version \"$VERSION\"/" \
+            -e "s/^  sha256 \".*\"/  sha256 \"$SHA\"/" irkt.rb
+          grep -q "version \"$VERSION\"" irkt.rb && grep -q "$SHA" irkt.rb
+          gh api -X PUT "$API" \
+            -f message="irkt $VERSION" \
+            -f content="$(base64 -i irkt.rb | tr -d '\n')" \
+            -f sha="$BLOB" >/dev/null
+          echo "cask updated to $VERSION ($SHA)"
 
       - name: Clean up keychain
         if: always()
