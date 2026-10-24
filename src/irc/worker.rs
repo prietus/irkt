@@ -53,7 +53,9 @@ const WANT_EXTRA_CAPS: &[&str] = &[
     "draft/typing",
     "draft/read-marker",
     "draft/message-redaction",
-    "draft/event-playback",
+    // NB: no `draft/event-playback`. It fills history pages with replayed
+    // JOIN/PART/QUIT that irkt drops anyway (applying them corrupts the
+    // roster), so a page from a busy channel came back with ~no messages.
     "draft/sasl-ir",
     // Per-target soju flags (blocked/muted/pinned) and user profiles.
     "draft/metadata-2",

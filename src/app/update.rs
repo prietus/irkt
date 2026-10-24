@@ -8,7 +8,7 @@ use crate::irc::{Event, MsgMeta, Outgoing, TypingState};
 /// recently" before surfacing their nick-change in a channel.
 const NICK_ACTIVITY_WINDOW: usize = 200;
 /// How many messages to request per CHATHISTORY page (LATEST and BEFORE).
-const HISTORY_LIMIT: u32 = 50;
+const HISTORY_LIMIT: u32 = 100;
 /// Reconnect catch-up pages (`CHATHISTORY AFTER`) before giving up on the gap
 /// and jumping to the latest page.
 const CATCHUP_MAX_PAGES: u8 = 10;
