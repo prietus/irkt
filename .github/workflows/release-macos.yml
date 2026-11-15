@@ -27,8 +27,10 @@ permissions:
 
 jobs:
   build:
-    # macos-14 is Apple Silicon, so `cargo build --release` is arm64 natively.
-    runs-on: macos-14
+    # macos-latest is Apple Silicon, so `cargo build --release` is arm64
+    # natively. (Pinned macos-14 stopped being offered: "configuration
+    # 'macos-14-arm64-us-default' is not supported".)
+    runs-on: macos-latest
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
       # Lets the cask update below skip cleanly when the secret isn't set.
