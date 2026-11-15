@@ -326,6 +326,9 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
         };
         let read_marker = buf.read_marker.as_deref();
         let mut marker_drawn = false;
+        // The top-level line drawn just above, for grouping a run of
+        // messages from one nick under a single nick label.
+        let mut prev_top: Option<usize> = None;
         for i in 0..lines.len() {
             if is_child[i] || is_hidden(&lines[i], &ignored) {
                 continue;
@@ -345,8 +348,11 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &mut App) {
             {
                 rows.push(read_marker_row(width, ctx.theme));
                 marker_drawn = true;
+                prev_top = None;
             }
-            push_message(&ctx, i, 0, &mut rows, &mut placements, &mut sel_range, &mut row_msgids);
+            let group = prev_top.filter(|&p| continues_run(&ctx, p, i)).map(|p| &lines[p]);
+            push_message(&ctx, i, 0, group, &mut rows, &mut placements, &mut sel_range, &mut row_msgids);
+            prev_top = Some(i);
         }
     }
 
@@ -547,6 +553,30 @@ struct RenderCtx<'a> {
     reply_context: &'a std::collections::HashMap<String, Line>,
 }
 
+/// Whether line `i` continues a run started by the line drawn just above it
+/// (`prev`): same sender and kind, within the same hour, with nothing drawn
+/// between them — no reply thread under `prev`, no "reply to an earlier
+/// message" header over `i`.
+fn continues_run(ctx: &RenderCtx, prev: usize, i: usize) -> bool {
+    let (a, b) = (&ctx.lines[prev], &ctx.lines[i]);
+    let same_hour = match (&a.ts_iso, &b.ts_iso) {
+        // `YYYY-MM-DDTHH`
+        (Some(x), Some(y)) => x.get(..13) == y.get(..13),
+        _ => true,
+    };
+    let thread_below_prev = ctx
+        .children
+        .get(&prev)
+        .is_some_and(|kids| kids.iter().any(|&k| !is_hidden(&ctx.lines[k], ctx.ignored)));
+    let orphan_reply = b.reply_to.as_deref().is_some_and(|pid| !ctx.msgids.contains_key(pid));
+    matches!(b.kind, LineKind::Message | LineKind::Self_)
+        && a.kind == b.kind
+        && a.from.eq_ignore_ascii_case(&b.from)
+        && same_hour
+        && !thread_below_prev
+        && !orphan_reply
+}
+
 /// A message from an ignored nick: kept in the buffer, not drawn.
 fn is_hidden(line: &Line, ignored: &[String]) -> bool {
     matches!(line.kind, LineKind::Message | LineKind::Action)
@@ -558,6 +588,8 @@ fn push_message(
     ctx: &RenderCtx,
     idx: usize,
     depth: usize,
+    // The line this one continues a run of (see `continues_run`), if any.
+    group: Option<&Line>,
     rows: &mut Vec<RLine<'static>>,
     placements: &mut Vec<(usize, u16, u16, String)>,
     sel_range: &mut Option<(usize, usize)>,
@@ -568,7 +600,7 @@ fn push_message(
     let is_selected = ctx.selection.is_some() && line.msgid.as_deref() == ctx.selection;
     let row_start = rows.len();
     let mut these = if depth == 0 {
-        render_line(line, ctx.width, t)
+        render_line(line, group, ctx.width, t)
     } else {
         render_reply_child(line, depth, ctx.width, t)
     };
@@ -678,7 +710,7 @@ fn push_message(
     if depth < 8 {
         if let Some(kids) = ctx.children.get(&idx) {
             for &k in kids.iter().filter(|&&k| !is_hidden(&ctx.lines[k], ctx.ignored)) {
-                push_message(ctx, k, depth + 1, rows, placements, sel_range, row_msgids);
+                push_message(ctx, k, depth + 1, None, rows, placements, sel_range, row_msgids);
             }
         }
     }
@@ -732,19 +764,24 @@ fn mention_style(style: Style, t: &Theme) -> Style {
 }
 
 /// Format one buffer line into one or more wrapped terminal rows.
-fn render_line(line: &Line, width: usize, t: &Theme) -> Vec<RLine<'static>> {
-    let time = if line.time.is_empty() {
+/// `group` is the line just above when this one continues its sender's run:
+/// the nick is then left blank (same width, so the text stays aligned), and
+/// so is the time unless the minute changed.
+fn render_line(line: &Line, group: Option<&Line>, width: usize, t: &Theme) -> Vec<RLine<'static>> {
+    let time = if line.time.is_empty() || group.is_some_and(|g| g.time == line.time) {
         "     ".to_string()
     } else {
         line.time.clone()
     };
+    let blank_nick = " ".repeat(line.from.width());
+    let shown_nick = if group.is_some() { &blank_nick } else { &line.from };
     // Build the gutter spans and the plain prefix used for wrap math.
     let (gutter, prefix_len, text_style): (Vec<Span<'static>>, usize, Style) = match line.kind {
         LineKind::Message => {
             let nick = &line.from;
             let g = vec![
                 Span::styled(format!("{time} "), Style::default().fg(t.dim)),
-                Span::styled(format!("{nick} "), Style::default().fg(t.nick(nick)).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{shown_nick} "), Style::default().fg(t.nick(nick)).add_modifier(Modifier::BOLD)),
             ];
             (g, time.width() + 1 + nick.width() + 1, Style::default().fg(t.text))
         }
@@ -752,7 +789,7 @@ fn render_line(line: &Line, width: usize, t: &Theme) -> Vec<RLine<'static>> {
             let nick = &line.from;
             let g = vec![
                 Span::styled(format!("{time} "), Style::default().fg(t.dim)),
-                Span::styled(format!("{nick} "), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{shown_nick} "), Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
             ];
             (g, time.width() + 1 + nick.width() + 1, Style::default().fg(t.bright))
         }
@@ -1613,6 +1650,51 @@ mod render_tests {
         assert_eq!(member_subtitle(&net, "alice", 40).as_deref(), Some(" Alice Liddell · she/her"));
         let cut = member_subtitle(&net, "alice", 10).unwrap();
         assert!(cut.ends_with('…') && cut.width() <= 10);
+    }
+
+    #[test]
+    fn consecutive_messages_from_one_nick_share_a_nick_label() {
+        let (img_tx, _r) = mpsc::channel(1);
+        std::mem::forget(_r);
+        let images = Images::new(Picker::from_fontsize((8, 16)), img_tx);
+        let mut app = App::new(AppConfig::default(), images);
+        let (out, _r2) = mpsc::channel(8);
+        std::mem::forget(_r2);
+        app.networks.push(Network::new(0, net_cfg(), out));
+        let bi = app.networks[0].ensure_buffer("#chan", BufferKind::Channel);
+        for (time, who, txt) in [
+            ("12:00", "alice", "first"),
+            ("12:00", "alice", "second"),
+            ("12:01", "alice", "third"),
+            ("12:01", "bob", "other"),
+            ("12:02", "alice", "again"),
+        ] {
+            app.networks[0].buffers[bi].push(Line {
+                time: time.into(), kind: LineKind::Message, from: who.into(),
+                text: txt.into(), msgid: None, highlight: false, reply_to: None, ts_iso: None,
+            });
+        }
+        app.active = ActiveBuffer { net: 0, buf: bi };
+        app.show_members = false;
+        app.show_sidebar = false;
+        let mut term = Terminal::new(TestBackend::new(60, 9)).unwrap();
+        term.draw(|f| { draw(f, &mut app); }).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect();
+        let row = |needle: &str| rows.iter().find(|r| r.contains(needle)).unwrap().clone();
+        assert!(row("first").contains("12:00 alice first"));
+        // Same minute: neither time nor nick, text aligned under "first".
+        let second = row("second");
+        assert!(!second.contains("alice") && !second.contains("12:00"));
+        assert_eq!(second.find("second"), row("first").find("first"));
+        // Minute changed: the time shows, the nick still doesn't.
+        let third = row("third");
+        assert!(third.contains("12:01") && !third.contains("alice"));
+        // Someone else in between starts a new run.
+        assert!(row("other").contains("bob"));
+        assert!(row("again").contains("12:02 alice again"));
     }
 
     #[test]
